@@ -1,73 +1,43 @@
-# React + TypeScript + Vite
+# 📊 AUTOMYRIX Execution Dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The **Execution Dashboard** is a premium, real-time interface designed for monitoring, auditing, and controlling automated test sessions within the NIDOWORKZ Inspectra ecosystem.
 
-Currently, two official plugins are available:
+## ✨ Key Features
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- **Setup Chat**: An interactive interface to guide users through the complex environment provisioning process.
+- **Live Tracking**: Real-time visualization of packet flows (PB/PD/PC) and service logs.
+- **Execution Reports**: High-fidelity data visualization using Recharts to track success rates, latency, and throughput.
+- **JSON Data Audit**: Direct access to raw execution data for deep-dive debugging and validation.
 
-## React Compiler
+## 🛠️ Technology Stack
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- **Framework**: React 18+ (Vite)
+- **Styling**: Vanilla CSS (Premium Aesthetics)
+- **Charts**: Recharts
+- **Icons**: Lucide React
+- **Networking**: Socket.io-client & Axios
 
-## Expanding the ESLint configuration
+## 📁 Project Structure
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+- `src/components/`: Modular UI components (Dashboard, SetupPanel, ExecutionReport).
+- `src/hooks/`: Custom hooks for socket management and data fetching.
+- `src/styles/`: Centralized design system with modern tokens and animations.
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+## ⚙️ Setup
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+1.  **Install Deps**: `npm install`
+2.  **Configure Env**: 
+    ```env
+    VITE_API_BASE=http://localhost:4200
+    VITE_ORCHESTRATOR_URL=ws://localhost:4200
+    ```
+3.  **Development**: `npm run dev`
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+## 🎨 Design Principles
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+- **Premium Aesthetics**: Uses dark mode with vibrant gradients and glassmorphism.
+- **Interactive Micro-animations**: Enhances UX through subtle hover effects and transitions.
+- **Responsive Layout**: Fully functional across desktop and tablets.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+---
+**NIDOWORKZ Proprietary Tool**

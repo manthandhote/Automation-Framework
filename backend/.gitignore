@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.js
+*.js.map
+!remote_cleanup.js
+!get_session.js
+.env
+*.log
+runs/
+compile_errors.txt
+.vscode/
+.DS_Store
