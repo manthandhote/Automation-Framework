@@ -16,6 +16,7 @@ import { UIValidator } from './ui-validator';
 import { InspectraDB } from './inspectra-db';
 import { TestRunner } from './test-runner';
 import { logger } from './logger';
+let infraSocket: any = null; // dedicated slot for the VM infra-node socket
 
 const app = express();
 const httpServer = createServer(app);
@@ -279,12 +280,12 @@ app.get('/api/sessions/:id/report', async (req, res) => {
     const sessionId = req.params.id;
     const session = await inspectraDb.getSession(sessionId);
     if (!session) return res.status(404).json({ error: 'Session not found' });
-    
+
     const analysis = await inspectraDb.getAnalysis(sessionId);
     const results = await inspectraDb.getResults(sessionId);
-    
+
     const tr = new TestRunner(mongoUri, workspacePath);
-    
+
     const report = await tr.assembleFinalReport(
       sessionId,
       'infra-node-01',
@@ -337,34 +338,74 @@ io.on('connection', (socket) => {
   logger.info(`Client connected: ${socket.id}`, 'SOCKET');
   socket.emit('system:init', { health: orchestrator.getHealth() });
 
-  // ── Phase 2: Infra Discovery ────────────────────────────────────────────────
   socket.on('infra:register', (vmInfo) => {
+    infraSocket = socket; // ← store ONLY the infra-node socket here
     logger.info(`[INFRA] VM Registered: ${vmInfo.hostname} (${vmInfo.os})`, 'INFRA');
+    io.emit('infra:vm-connected', { hostname: vmInfo.hostname, os: vmInfo.os });
   });
 
   socket.on('infra:status', (status) => {
     logger.info(`[INFRA] Nginx: ${status.nginx}, PHP: ${status.php}`, 'INFRA');
+    io.emit('infra:vm-status', status); // forward to frontend
   });
 
   socket.on('infra:service-status', (data) => {
     logger.info(`[INFRA] Service ${data.serviceName} is ${data.status}`, 'INFRA');
   });
-  
+
+  // Relay setup progress from infra-node → frontend
+  socket.on('setup:progress', (data) => {
+    io.emit('setup:progress', data);
+  });
+
+  // Relay log lines from infra-node → frontend terminal
   socket.on('simulator:packet', (data) => {
-    io.emit('simulator:packet', data); // relay to frontend
+    io.emit('simulator:packet', data);
+  });
+
+  socket.on('infra:log', (data) => {
+    io.emit('simulator:packet', { data: data.message, timestamp: new Date().toISOString() });
+  });
+
+  socket.on('disconnect', () => {
+    if (infraSocket?.id === socket.id) {
+      infraSocket = null;
+      logger.info('[INFRA] VM infra-node disconnected', 'INFRA');
+      io.emit('infra:vm-disconnected', {});
+    }
+    logger.info(`Client disconnected: ${socket.id}`, 'SOCKET');
   });
 });
 
 export const simulateOnInfra = async (data: any): Promise<any> => {
   return new Promise((resolve, reject) => {
-    if (io.sockets.sockets.size === 0) {
-      return reject(new Error("No infra-node connected to orchestrator"));
+    if (!infraSocket) {
+      return reject(new Error('No infra-node connected. Is the VM agent running?'));
     }
-    const [firstSocket] = io.sockets.sockets.values();
-    firstSocket.timeout(20000).emit('infra:simulate-cycle', data, (err: any, response: any) => {
-      if (err) return reject(new Error("Simulation timed out on infra-node"));
-      if (!response.success) return reject(new Error(response.error || "Remote simulation failed"));
+    infraSocket.timeout(20000).emit('infra:simulate-cycle', data, (err: any, response: any) => {
+      if (err) return reject(new Error('Simulation timed out on infra-node'));
+      if (!response?.success) return reject(new Error(response?.error || 'Remote simulation failed'));
       resolve(response.result);
+    });
+  });
+};
+
+export const emitToInfra = (event: string, data: any): void => {
+  if (!infraSocket) {
+    logger.warn('[ORCHESTRATOR] No infra-node connected — cannot emit: ' + event, 'INFRA');
+    return;
+  }
+  infraSocket.emit(event, data);
+};
+export const emitToInfraWithAck = (event: string, data: any, timeoutMs = 300000): Promise<any> => {
+  return new Promise((resolve, reject) => {
+    if (!infraSocket) {
+      return reject(new Error('No infra-node connected. Is the VM agent running?'));
+    }
+    infraSocket.timeout(timeoutMs).emit(event, data, (err: any, response: any) => {
+      if (err) return reject(new Error(`Infra ack timeout for event: ${event}`));
+      if (!response?.success) return reject(new Error(response?.error || `Infra returned failure for: ${event}`));
+      resolve(response);
     });
   });
 };

@@ -1,6 +1,7 @@
 import { exec } from 'child_process';
 import util from 'util';
 import { logger } from './logger';
+import path from 'path';
 
 const execAsync = util.promisify(exec);
 
@@ -96,6 +97,22 @@ export class Installer {
     return false;
   }
 
+  static async checkAndInstallGit(): Promise<boolean> {
+    if (await Installer.isBinaryAvailable('git --version')) {
+      logger.info('Git is already installed.');
+      return true;
+    }
+    logger.info('Git not found. Installing...');
+    if (!await Installer.verifySudo()) return false;
+    await Installer.prepareApt();
+    if (await Installer.aptInstall('git')) {
+      logger.info('Git installed successfully.');
+      return true;
+    }
+    logger.error('Git install failed. Run manually: sudo apt-get install -y git');
+    return false;
+  }
+
   // ─── SUDO VERIFICATION ────────────────────────────────────────────────────
 
   private static async verifySudo(): Promise<boolean> {
@@ -107,11 +124,7 @@ export class Installer {
       logger.error('Passwordless sudo required. Run this ONE TIME then restart:');
       logger.error('');
       logger.error("  sudo tee /etc/sudoers.d/automyrix-installer << 'EOF'");
-      logger.error('  manthan ALL=(ALL) NOPASSWD: /usr/bin/apt-get');
-      logger.error('  manthan ALL=(ALL) NOPASSWD: /usr/bin/dpkg');
-      logger.error('  manthan ALL=(ALL) NOPASSWD: /usr/bin/tee');
-      logger.error('  manthan ALL=(ALL) NOPASSWD: /usr/bin/truncate');
-      logger.error('  manthan ALL=(ALL) NOPASSWD: /usr/bin/systemctl');
+      logger.error('  manthan ALL=(ALL) NOPASSWD: ALL');
       logger.error('  EOF');
       logger.error('  sudo chmod 440 /etc/sudoers.d/automyrix-installer');
       logger.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
@@ -191,62 +204,78 @@ export class Installer {
 
   static async setupProjectRepos(
     backendRepoUrl: string,
+    backendBranch: string,        // ← add branch params
     frontendRepoUrl: string,
-    onProgress: (msg: string) => void
+    frontendBranch: string,
+    onProgress: (msg: string) => void,
+    patToken?: string
   ): Promise<{ success: boolean; error?: string }> {
-    try {
-      // ── 1. Ensure /data/NIDOWORKZ exists ─────────────────────────────
-      onProgress('Creating /data/NIDOWORKZ directory...');
-      await Installer.safeExec(`${SUDO} mkdir -p /data/NIDOWORKZ`);
-      await Installer.safeExec(`${SUDO} chmod 777 /data/NIDOWORKZ`);
 
-      // ── 2. Clone / pull backend ───────────────────────────────────────
-      const backendDest = '/data/NIDOWORKZ/CSND';
-      if (await Installer.pathExists(backendDest)) {
-        onProgress('Backend repo already exists – pulling latest...');
-        await execAsync(`git -C ${backendDest} pull`, { env: NO_PROXY_ENV, timeout: 60000 });
-      } else {
-        onProgress(`Cloning backend repo into ${backendDest}...`);
-        await execAsync(`git clone ${backendRepoUrl} ${backendDest}`, {
-          env: NO_PROXY_ENV,
-          timeout: 120000,
-        });
+    const injectPat = (url: string, pat: string): string => {
+      if (url.includes('@')) {
+        // Insert :PAT between the username and the @ symbol
+        return url.replace(/@/, `:${pat}@`);
       }
-      onProgress('Backend repo ready.');
+      return url.replace('https://', `https://${pat}@`);
+    };
+    const beUrl = patToken ? injectPat(backendRepoUrl, patToken) : backendRepoUrl;
+    const feUrl = patToken ? injectPat(frontendRepoUrl, patToken) : frontendRepoUrl;
 
-      // ── 3. Clone / pull frontend ──────────────────────────────────────
-      const frontendCloneDest = '/var/www/FE-CSND';
+    const NO_PROMPT_ENV = {
+      ...NO_PROXY_ENV,
+      GIT_TERMINAL_PROMPT: '0',       // never prompt
+      GIT_ASKPASS: 'echo',            // return empty string if asked
+    };
+
+    try {
+      // ── Backend ────────────────────────────────────────────────────────
+      const backendDest = '/data/NIDOWORKZ/CSND';
+      await execAsync(`${SUDO} mkdir -p /data/NIDOWORKZ`, { env: NO_PROMPT_ENV });
+      await execAsync(`${SUDO} chmod 777 /data/NIDOWORKZ`, { env: NO_PROMPT_ENV });
+
+      if (await Installer.pathExists(backendDest)) {
+        onProgress('Backend repo exists — pulling latest...');
+        await execAsync(
+          `git -C ${backendDest} pull`,
+          { env: NO_PROMPT_ENV, timeout: 120000 }
+        );
+      } else {
+        onProgress(`Cloning backend (branch: ${backendBranch})...`);
+        const { stderr } = await execAsync(
+          `git clone --branch ${backendBranch} "${beUrl}" ${backendDest}`,
+          { env: NO_PROMPT_ENV, timeout: 300000 }
+        );
+        if (stderr) onProgress(`git stderr: ${stderr.split('\n')[0]}`);
+      }
+      onProgress('✅ Backend ready at /data/NIDOWORKZ/CSND');
+
+      // ── Frontend ───────────────────────────────────────────────────────
       const frontendFinalDest = '/var/www/html';
 
-      if (await Installer.pathExists(frontendCloneDest)) {
-        onProgress('Frontend repo already cloned – pulling latest...');
-        await execAsync(`git -C ${frontendCloneDest} pull`, { env: NO_PROXY_ENV, timeout: 60000 });
+      if (await Installer.pathExists(path.join(frontendFinalDest, '.git'))) {
+        onProgress('Frontend repo exists — pulling latest...');
+        await execAsync(
+          `${SUDO} git -C ${frontendFinalDest} pull`,
+          { env: NO_PROMPT_ENV, timeout: 120000 }
+        );
       } else {
-        onProgress(`Cloning frontend repo into ${frontendCloneDest}...`);
-        await execAsync(`${SUDO} git clone ${frontendRepoUrl} ${frontendCloneDest}`, {
-          env: NO_PROXY_ENV,
-          timeout: 120000,
-        });
+        // Remove dir if it exists but isn't a git repo (e.g. default nginx html)
+        await execAsync(`${SUDO} rm -rf ${frontendFinalDest}`, { env: NO_PROMPT_ENV });
+        onProgress(`Cloning frontend (branch: ${frontendBranch})...`);
+        const { stderr } = await execAsync(
+          `${SUDO} git clone --branch ${frontendBranch} "${feUrl}" ${frontendFinalDest}`,
+          { env: NO_PROMPT_ENV, timeout: 300000 }
+        );
+        if (stderr) onProgress(`git stderr: ${stderr.split('\n')[0]}`);
       }
+      await execAsync(`${SUDO} chmod -R 755 ${frontendFinalDest}`, { env: NO_PROMPT_ENV });
+      onProgress('✅ Frontend ready at /var/www/html');
 
-      // ── 4. Rename FE-CSND → html ──────────────────────────────────────
-      if (!(await Installer.pathExists(frontendFinalDest))) {
-        onProgress(`Renaming ${frontendCloneDest} → ${frontendFinalDest}...`);
-        await execAsync(`${SUDO} mv ${frontendCloneDest} ${frontendFinalDest}`, {
-          env: NO_PROXY_ENV,
-        });
-      } else {
-        onProgress(`${frontendFinalDest} already exists – skipping rename.`);
-      }
-      await Installer.safeExec(`${SUDO} chmod -R 777 ${frontendFinalDest}`);
-      onProgress('Frontend repo ready at /var/www/html.');
-
-      // ── 5. Write Nginx config ─────────────────────────────────────────
-      onProgress('Writing Nginx site config...');
+      // ── Nginx config ───────────────────────────────────────────────────
+      onProgress('Writing Nginx config (port 7001)...');
       const nginxConfig = `server {
     listen 7001;
     server_name 127.0.0.1;
-
     root /var/www/html;
     index index.php index.html index.htm;
 
@@ -254,11 +283,9 @@ export class Installer {
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
     add_header Referrer-Policy "no-referrer" always;
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
 
     location ~* \\.(css|js|png|jpg|jpeg|gif|ico|woff2?|ttf|eot|svg)$ {
-        access_log off;
-        expires 30d;
+        access_log off; expires 30d;
         add_header Cache-Control "public";
     }
 
@@ -270,11 +297,7 @@ export class Installer {
             add_header Access-Control-Max-Age 86400;
             return 204;
         }
-
-        limit_except GET POST PUT {
-            deny all;
-        }
-
+        limit_except GET POST PUT { deny all; }
         try_files $uri $uri/ /index.php?$args;
     }
 
@@ -287,58 +310,33 @@ export class Installer {
 
     location ~ /\\. { deny all; }
     location ~ ^/vendor/ { deny all; return 403; }
-}
-`;
+}`;
 
-      // Write to a temp file then sudo-copy it into place
-      const tmpConf = '/tmp/automyrix-nginx.conf';
-      await execAsync(`cat > ${tmpConf} << 'NGINXEOF'\n${nginxConfig}\nNGINXEOF`, {
-        env: NO_PROXY_ENV,
-      });
-      await execAsync(
-        `${SUDO} cp ${tmpConf} /etc/nginx/sites-available/default`,
-        { env: NO_PROXY_ENV }
-      );
+      await execAsync(`cat << 'EOF' | ${SUDO} tee /etc/nginx/sites-available/default > /dev/null\n${nginxConfig}\nEOF`, { env: NO_PROXY_ENV });
+      await Installer.safeExec(`${SUDO} ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default`);
 
-      // Ensure symlink in sites-enabled exists
-      await Installer.safeExec(
-        `${SUDO} ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default`
-      );
-      onProgress('Nginx config written.');
-
-      // ── 6. Patch env.php ──────────────────────────────────────────────
+      // ── Patch env.php ──────────────────────────────────────────────────
       const envPhp = '/var/www/html/includes/env.php';
       if (await Installer.pathExists(envPhp)) {
-        onProgress('Patching env.php (IP + path)...');
-        // Replace any bare IP that looks like a LAN address with 127.0.0.1
-        await execAsync(
-          `${SUDO} sed -i "s|192\\.168\\.[0-9]\\+\\.[0-9]\\+|127.0.0.1|g" ${envPhp}`,
-          { env: NO_PROXY_ENV }
-        );
-        // Replace /FE-CSND/ with /
-        await execAsync(
-          `${SUDO} sed -i "s|/FE-CSND/|/|g" ${envPhp}`,
-          { env: NO_PROXY_ENV }
-        );
-        onProgress('env.php patched.');
-      } else {
-        onProgress(`WARNING: ${envPhp} not found – skipping patch.`);
+        onProgress('Patching env.php...');
+        await execAsync(`${SUDO} sed -i "s|192\\.168\\.[0-9]\\+\\.[0-9]\\+|127.0.0.1|g" ${envPhp}`, { env: NO_PROXY_ENV });
+        await execAsync(`${SUDO} sed -i "s|/FE-CSND/|/|g" ${envPhp}`, { env: NO_PROXY_ENV });
+        onProgress('✅ env.php patched');
       }
 
-      // ── 7. Validate & reload Nginx ────────────────────────────────────
-      onProgress('Testing Nginx configuration...');
+      // ── Reload nginx ───────────────────────────────────────────────────
       await execAsync(`${SUDO} nginx -t`, { env: NO_PROXY_ENV, timeout: 10000 });
-      await execAsync(`${SUDO} /usr/bin/systemctl reload nginx`, {
-        env: NO_PROXY_ENV,
-        timeout: 15000,
-      });
-      onProgress('Nginx reloaded. Setup complete ✓');
+      await execAsync(`${SUDO} /usr/bin/systemctl reload nginx`, { env: NO_PROXY_ENV, timeout: 15000 });
+      onProgress('✅ Nginx reloaded — frontend at http://127.0.0.1:7001');
 
       return { success: true };
+
     } catch (err: any) {
-      const msg = err.message?.split('\n')[0] ?? String(err);
-      logger.error(`setupProjectRepos failed: ${msg}`);
-      return { success: false, error: msg };
+      const stderr = err.stderr?.trim() || '';
+      const firstLine = err.message?.split('\n')[0] ?? String(err);
+      const fullMsg = stderr ? `${firstLine} | stderr: ${stderr}` : firstLine;
+      logger.error(`setupProjectRepos failed: ${fullMsg}`);
+      return { success: false, error: fullMsg };
     }
   }
 

@@ -3,18 +3,20 @@ import { TestCaseBuilder } from './test-case-builder';
 import axios from 'axios';
 import { LlamaAnalyst } from './llama-analyst';
 import { InspectraDB } from './inspectra-db';
-import { CodeAnalyzer, CodeSummary } from './code-analyzer';
+import { CodeSummary } from './code-analyzer';
 import { DbAnalyzer, DbSummary } from './db-analyzer';
 import { TestRunner } from './test-runner';
-import { AdvancedSimulator } from './platform/advanced-simulator';
-import { LifecycleValidator } from './platform/lifecycle-validator';
+//import { AdvancedSimulator } from './platform/advanced-simulator';
+//import { LifecycleValidator } from './platform/lifecycle-validator';
 import { E2ETestRunner, E2EReport } from './platform/e2e-test-runner';
-import { MongoClient } from 'mongodb';
-import { spawn, ChildProcess, exec } from 'child_process';
+//import { MongoClient } from 'mongodb';
+//import { spawn, ChildProcess, exec } from 'child_process';
+import { exec, ChildProcess } from 'child_process';
 import util from 'util';
 import path from 'path';
 import fs from 'fs';
 import { logger } from './logger';
+import { emitToInfra, emitToInfraWithAck } from './index';
 
 const execAsync = util.promisify(exec);
 
@@ -155,13 +157,6 @@ export class Orchestrator {
     onProgress?.('Initializing', 5);
 
     try {
-      // 1. Ensure DB (Graceful failure)
-      try {
-        await this.ensureTestDb(onLog);
-      } catch (e: any) {
-        onLog(`[WARNING] Test MongoDB provisioning failed: ${e.message}. Using fallback...`);
-      }
-
       await this.inspectraDb.createSession({
         sessionId: config.sessionId,
         clientName: config.clientName,
@@ -177,68 +172,63 @@ export class Orchestrator {
         startedAt: new Date()
       });
 
-      onLog(`[GIT] Preparing repositories...`);
-      onProgress?.('Cloning Repositories', 15);
-      const { targetPath: bePath, metadata: beMetadata } = await this.git.cloneOrUpdate(config.beRepo, `be_${config.sessionId}`, config.beBranch);
-      const { targetPath: fePath, metadata: feMetadata } = await this.git.cloneOrUpdate(config.feRepo, `fe_${config.sessionId}`, config.feBranch);
-      
-      const prevSession = await this.inspectraDb.getLatestSessionForRepo(config.beRepo);
-      const commitTag = (prevSession && prevSession.beCommit === beMetadata.commit_id) ? 'SAME_COMMIT' : 'NEW_COMMIT';
-      onLog(`[GIT] BE Repo is at ${beMetadata.commit_id} (${commitTag}) by ${beMetadata.author}`);
+      // ── STEP 1: Delegate repo setup + nginx config to VM infra-node ─────
+      onLog(`[ORCHESTRATOR] Delegating repo setup to VM infra-node...`);
+      onProgress?.('Setting Up VM', 10);
 
-      await this.inspectraDb.updateSession(config.sessionId, { beCommit: beMetadata.commit_id, feCommit: feMetadata.commit_id });
-
-      await this.configureNginx(fePath, config.sessionId, onLog);  // ✅
-
-      // BUILD LIBS INSIDE THE CLONE ONLY
-      await this.buildSharedLibraries(bePath, onLog);
-
-      // --- AUTO-PATCH env.php ---
-      const envPhpPath = path.join(fePath, 'includes', 'env.php');
-      if (fs.existsSync(envPhpPath)) {
-        onLog(`[SYSTEM] Patching env.php for local development...`);
-        let content = fs.readFileSync(envPhpPath, 'utf8');
-        content = content.replace(/\$apibaseurl\s*=\s*["'][^"']+["']/g, '$apibaseurl = "127.0.0.1"');
-        fs.writeFileSync(envPhpPath, content);
+      try {
+        await emitToInfraWithAck('infra:setup-project', {
+          backendRepoUrl: config.beRepo,
+          backendBranch: config.beBranch,
+          frontendRepoUrl: config.feRepo,
+          frontendBranch: config.feBranch,
+          patToken: process.env.AZURE_PAT,
+        }, 300000); // 5 min timeout for clone
+        onLog(`[ORCHESTRATOR] VM repo setup complete.`);
+      } catch (e: any) {
+        onLog(`[WARNING] VM setup failed: ${e.message} — continuing with analysis`);
       }
 
-      // --- AUTO-PATCH BFF MODELS ---
-      const bffModelsPath = path.join(bePath, 'apps', 'backend-for-frontend', 'src', 'models');
-      if (fs.existsSync(bffModelsPath)) {
-        onLog(`[SYSTEM] Patching BFF models to support session isolation...`);
-        const modelFiles = fs.readdirSync(bffModelsPath).filter(f => f.endsWith('.ts'));
-        for (const file of modelFiles) {
-          const filePath = path.join(bffModelsPath, file);
-          let content = fs.readFileSync(filePath, 'utf8');
+      // ── STEP 2: Get code analysis + commit info FROM the VM (no local clone) ──
+      onProgress?.('Analyzing Code on VM', 20);
+      onLog(`[ORCHESTRATOR] Requesting code analysis from VM...`);
 
-          const newContent = content.replace(
-            /\.useDb\(['"]([^'"]+)['"]\s*,\s*\{[^}]+\}\)/g,
-            (_, dbName) => `.useDb(process.env.MONGO_DB || '${dbName}', { useCache: true })`
-          );
-
-          if (content !== newContent) {
-            fs.writeFileSync(filePath, newContent);
-            onLog(`  - Patched ${file}`);
-          }
-        }
+      let codeSummary: CodeSummary;
+      try {
+        const analyzeResult = await emitToInfraWithAck('infra:analyze-code', {
+          bePath: '/data/NIDOWORKZ/CSND',
+        }, 60000);
+        codeSummary = analyzeResult.codeSummary;
+        onLog(`[ORCHESTRATOR] VM code analysis complete: ${codeSummary.totalServices} services found.`);
+      } catch (e: any) {
+        onLog(`[WARNING] VM code analysis failed: ${e.message} — using fallback`);
+        codeSummary = {
+          totalServices: 0,
+          services: [],
+          sharedLibs: [],
+          techStack: ['TypeScript', 'Node.js', 'Express', 'MongoDB'],
+          framework: 'npm workspaces monorepo'
+        };
       }
 
-      // --- AUTO-PATCH SHARED-DB ENGINE ---
-      const sharedDbEnginePath = path.join(bePath, 'libs', 'shared-db', 'src', 'engines', 'MongoEngine.ts');
-      if (fs.existsSync(sharedDbEnginePath)) {
-        onLog(`[SYSTEM] Patching Shared-DB MongoEngine for session isolation...`);
-        let content = fs.readFileSync(sharedDbEnginePath, 'utf8');
-        // Force the engine to use MONGO_DB environment variable if available
-        const newContent = content.replace(
-          /this\.db = this\.client\.db\(dbName\);/g,
-          `this.db = this.client.db(process.env.MONGO_DB || dbName);`
-        );
-        if (content !== newContent) {
-          fs.writeFileSync(sharedDbEnginePath, newContent);
-          onLog(`  - Patched MongoEngine.ts`);
-        }
-      }
+      let beCommit = 'unknown';
+      let feCommit = 'unknown';
+      try {
+        const beInfo = await emitToInfraWithAck('infra:get-commit-info', { repoPath: '/data/NIDOWORKZ/CSND' }, 10000);
+        beCommit = beInfo.metadata?.commit_id || 'unknown';
+        onLog(`[GIT] BE Repo commit: ${beCommit} by ${beInfo.metadata?.author || 'unknown'}`);
+      } catch { /* ignore */ }
+      try {
+        const feInfo = await emitToInfraWithAck('infra:get-commit-info', { repoPath: '/var/www/html' }, 10000);
+        feCommit = feInfo.metadata?.commit_id || 'unknown';
+      } catch { /* ignore */ }
 
+      await this.inspectraDb.updateSession(config.sessionId, {
+        beCommit,
+        feCommit
+      });
+
+      // ── STEP 3: DB restore + analysis (runs on host, mongo is on host) ──
       const restoredDbName = `inspectra_csnd_${config.sessionId}`;
       let dbSummary: DbSummary | null = null;
 
@@ -251,13 +241,10 @@ export class Orchestrator {
         dbSummary = await dbAnalyzer.analyze();
       }
 
-      onLog(`[AI] Analyzing data + code...`);
+      // ── STEP 4: LLM Analysis (runs on host, using codeSummary from VM) ───
+      onLog(`[AI] Analyzing code + database...`);
       onProgress?.('AI Analysis', 50);
 
-      const codeAnalyzer = new CodeAnalyzer(bePath);
-      const codeSummary = await codeAnalyzer.analyze();
-
-      // Create a virtual DB summary if none exists
       if (!dbSummary) {
         dbSummary = {
           dbName: restoredDbName,
@@ -266,7 +253,7 @@ export class Orchestrator {
           machines: [{
             id: 'virtual-01',
             name: config.machineDescriptions || 'Default Machine',
-            machine_key: 'virtual-01',
+            machine_key: 'MA01',
             type: 'sorter',
             location: 'Remote',
             status: true,
@@ -279,56 +266,49 @@ export class Orchestrator {
         };
       }
 
-      await this.inspectraDb.updateSession(config.sessionId, { machineCount: dbSummary!.totalMachines });
+      await this.inspectraDb.updateSession(config.sessionId, { machineCount: dbSummary.totalMachines });
 
       const [codeInsights, dbInsights, scalingData] = await Promise.all([
         this.llama.analyzeCodebase(codeSummary),
-        this.llama.analyzeDatabase(dbSummary!),
-        this.llama.analyzeConfig(dbSummary!)
+        this.llama.analyzeDatabase(dbSummary),
+        this.llama.analyzeConfig(dbSummary)
       ]);
 
       await this.inspectraDb.saveAnalysis({
         sessionId: config.sessionId,
         codeInsights, dbInsights,
         scalingPlan: scalingData.scaling,
-        recommendations: scalingData.scaling.map(s => `${s.service}: ${s.reason}`),
+        recommendations: scalingData.scaling.map((s: any) => `${s.service}: ${s.reason}`),
         generatedAt: new Date()
       });
 
+      // ── STEP 5: Generate test cases (LLM on host) ────────────────────────
       onLog(`[AI] Generating test cases...`);
       onProgress?.('Generating Tests', 70);
-      const testCases = await this.generateSessionTestCases(config.sessionId, bePath, restoredDbName, dbSummary);
+      const testCases = await this.generateSessionTestCases(
+        config.sessionId, codeSummary, restoredDbName, dbSummary
+      );
+      onLog(`[ORCHESTRATOR] Generated ${testCases.length} test cases.`);
 
-      onLog(`[ORCHESTRATOR] Provisioning complete. Generated ${testCases.length} test cases.`);
-
-      onLog(`[ORCHESTRATOR] Pre-starting services for session ${config.sessionId}...`);
-
-      const selectedMachine = dbSummary!.machines.find(m =>
-        m.type?.toLowerCase() === 'astro'
-      ) || dbSummary!.machines.find(m =>
-        (m as any).machine_key && m.name?.toLowerCase().includes('astro')
-      ) || dbSummary!.machines[0];
-
-      onLog(`[ORCHESTRATOR] Selected machine: ${selectedMachine?.name} | _id: ${selectedMachine?.id} | key: ${(selectedMachine as any)?.machine_key}`);
-
-      await this.spawnServices(bePath, config.sessionId, onLog, dbSummary, selectedMachine?.id);
-
+      // ── STEP 6: Tell infra-node to spawn the microservices on the VM ────
+      onLog(`[ORCHESTRATOR] Provisioning complete. Services will start when tests run.`);
       await this.inspectraDb.updateSession(config.sessionId, { status: 'COMPLETED' });
       onProgress?.('Ready', 100);
 
     } catch (err: any) {
       onLog(`[ERROR] Run failed: ${err.message}`);
       await this.inspectraDb.updateSession(config.sessionId, { status: 'FAILED', completedAt: new Date() });
-      await this.stopServices(config.sessionId, onLog);
       throw err;
     }
+
     return { status: 'PROVISIONED', sessionId: config.sessionId };
   }
-  private async configureNginx(fePath: string, sessionId: string, onLog?: (msg: string) => void) {
-  const simConfPath = 'C:/nginx/conf/sim_session.conf';
-  const normalizedPath = fePath.replace(/\\/g, '/');
 
-  const simConf = `
+  /*private async configureNginx(fePath: string, sessionId: string, onLog?: (msg: string) => void) {
+    const simConfPath = 'C:/nginx/conf/sim_session.conf';
+    const normalizedPath = fePath.replace(/\\/g, '/');
+
+    const simConf = `
 location /SIM/ {
     alias ${normalizedPath}/;
     index index.php index.html;
@@ -342,18 +322,18 @@ location /SIM/ {
 }
 `;
 
-  try {
-    fs.writeFileSync(simConfPath, simConf);
-    await execAsync('nginx -s reload');
-    onLog?.(`[NGINX] Session frontend available at http://localhost:7001/SIM/`);
-  } catch (e: any) {
-    onLog?.(`[WARNING] nginx reload failed: ${e.message}`);
-  }
-}
+    try {
+      fs.writeFileSync(simConfPath, simConf);
+      await execAsync('nginx -s reload');
+      onLog?.(`[NGINX] Session frontend available at http://localhost:7001/SIM/`);
+    } catch (e: any) {
+      onLog?.(`[WARNING] nginx reload failed: ${e.message}`);
+    }
+  }*/
 
   async generateSessionTestCases(
     sessionId: string,
-    bePath: string,
+    providedCodeSummary: CodeSummary,
     restoredDbName: string,
     providedSummary?: DbSummary
   ): Promise<any[]> {
@@ -363,8 +343,7 @@ location /SIM/ {
       dbSummary = await dbAnalyzer.analyze();
     }
 
-    const codeAnalyzer = new CodeAnalyzer(bePath);
-    const codeSummary = await codeAnalyzer.analyze();
+    const codeSummary = providedCodeSummary;
 
     // ✅ Call builder.buildWithLlm — NOT this.generateSessionTestCases
     const builder = new TestCaseBuilder(this.testDbUri, restoredDbName);
@@ -390,7 +369,6 @@ location /SIM/ {
     const session = await this.inspectraDb.getSession(sessionId);
     if (!session) throw new Error('Session not found');
 
-    const bePath = path.join(this.workspacePath, 'runs', `be_${sessionId}`);
     const testCases = await this.inspectraDb.getTestCases(sessionId);
     const dbName = session.restoredDbName || `inspectra_csnd_${sessionId}`;
 
@@ -401,7 +379,7 @@ location /SIM/ {
       || dbSummary.machines.find(m => (m as any).machine_key)
       || dbSummary.machines[0];
 
-    await this.executePhase(sessionId, bePath, dbName, testCases, onLog, onProgress, dbSummary, selectedMachine?.id);
+    await this.executePhase(sessionId, '/data/NIDOWORKZ/CSND', dbName, testCases, onLog, onProgress, dbSummary, selectedMachine?.id);
   }
 
   getHealth(): ServiceInfo[] {
@@ -476,115 +454,74 @@ location /SIM/ {
     return this.git.listRemoteBranches(repoUrl);
   }
 
-  async rerunSession(sessionId: string, onLog: (msg: string) => void, onProgress?: (step: string, percent: number) => void) {
+  async rerunSession(
+    sessionId: string,
+    onLog: (msg: string) => void,
+    onProgress?: (step: string, percent: number) => void
+  ) {
     onLog(`[ORCHESTRATOR] Rerunning session: ${sessionId}`);
-
-    // 1. Stop any existing services first to release locks
-    await this.stopServices(sessionId, onLog);
-    onLog(`[ORCHESTRATOR] Waiting for ports to be released...`);
-    await new Promise(r => setTimeout(r, 3000)); // Give OS time to clear sockets
 
     const session = await this.inspectraDb.getSession(sessionId);
     if (!session) throw new Error('Session not found');
 
-    const bePath = path.join(this.workspacePath, 'runs', `be_${sessionId}`);
-
-    if (!fs.existsSync(bePath)) {
-      throw new Error(`Source code missing at: ${bePath}. Please run a full setup first.`);
-    }
-
-    const libsPath = path.join(bePath, 'libs');
-    if (fs.existsSync(libsPath)) {
-      await this.buildSharedLibraries(bePath, onLog);
-    } else {
-      onLog(`[WARNING] libs folder not found — skipping shared library build`);
-    }
-
     try {
       await this.inspectraDb.updateSession(sessionId, { status: 'RUNNING', startedAt: new Date() });
-      await this.ensureTestDb(onLog);
 
       const dbName = session.restoredDbName || `inspectra_csnd_${sessionId}`;
-      const dbAnalyzer = new DbAnalyzer(this.testDbUri, dbName);
 
-      // 🛡️ CRITICAL: If session has a backup, we MUST restore it to ensure the DB exists for analysis/services
+      // Re-restore DB if backup exists (host-side mongo)
       if (session.dbBackupPath && fs.existsSync(session.dbBackupPath)) {
-        onLog(`[ORCHESTRATOR] Restoring session backup from ${session.dbBackupPath}...`);
+        onLog(`[ORCHESTRATOR] Re-restoring DB backup...`);
+        const dbAnalyzer = new DbAnalyzer(this.testDbUri, dbName);
         await dbAnalyzer.restoreBackup(session.dbBackupPath);
       }
 
-      onLog(`[ORCHESTRATOR] Verifying test database state...`);
-      const summary = await dbAnalyzer.analyze();
-
-      // Clone master machine configurations if missing
-      if (summary.totalMachines === 0 || (summary.totalMachines === 1 && summary.machines[0].id === 'machine-1')) {
-        onLog(`[ORCHESTRATOR] No machines found in session DB, cloning from master...`);
-        const client = new MongoClient(this.testDbUri);
-        try {
-          await client.connect();
-          const masterDb = client.db('machine_configurations');
-          const sessionDb = client.db(dbName);
-          const masterMachines = await masterDb.collection('machines').find().toArray();
-          if (masterMachines.length > 0) {
-            await sessionDb.collection('machines').insertMany(masterMachines);
-            onLog(`[ORCHESTRATOR] Cloned ${masterMachines.length} machines from master to session.`);
-            // Re-analyze after cloning
-            const updatedSummary = await dbAnalyzer.analyze();
-            Object.assign(summary, updatedSummary);
-          }
-        } catch (e: any) {
-          onLog(`[WARNING] Failed to clone machines: ${e.message}`);
-        } finally {
-          await client.close();
-        }
-      }
-      if (summary.totalMachines === 0 && session.dbBackupPath) {
-        onLog(`[ORCHESTRATOR] Test database is empty. Re-restoring backup...`);
-        await dbAnalyzer.restoreBackup(session.dbBackupPath);
-      }
-
+      const dbAnalyzer = new DbAnalyzer(this.testDbUri, dbName);
       const dbSummary = await dbAnalyzer.analyze();
-      const codeAnalyzer = new CodeAnalyzer(bePath);
-      const codeSummary = await codeAnalyzer.analyze();
 
-      const testCases = await this.generateSessionTestCases(
-        sessionId,
-        bePath,
-        dbName,
-        dbSummary
-      );
+      // Get code analysis from VM (no local clone needed)
+      let codeSummary: CodeSummary;
+      try {
+        const analyzeResult = await emitToInfraWithAck('infra:analyze-code', {
+          bePath: '/data/NIDOWORKZ/CSND',
+        }, 60000);
+        codeSummary = analyzeResult.codeSummary;
+      } catch (e: any) {
+        onLog(`[WARNING] VM code analysis failed: ${e.message} — using fallback`);
+        codeSummary = {
+          totalServices: 0, services: [], sharedLibs: [],
+          techStack: ['TypeScript', 'Node.js', 'Express', 'MongoDB'],
+          framework: 'npm workspaces monorepo'
+        };
+      }
+
+      const testCases = await this.generateSessionTestCases(sessionId, codeSummary, dbName, dbSummary);
 
       const selectedMachine = dbSummary.machines.find(m =>
         (m as any).machine_key && m.name?.toLowerCase().includes('astro')
       ) || dbSummary.machines.find(m => m.type?.toLowerCase() === 'astro')
         || dbSummary.machines[0];
 
-      const selectedMachineId = selectedMachine?.id;
-      onLog(`[ORCHESTRATOR] Selected machine: ${selectedMachine?.name} | _id: ${selectedMachineId} | key: ${(selectedMachine as any)?.machine_key}`);
+      onLog(`[ORCHESTRATOR] Selected machine: ${selectedMachine?.name} | key: ${(selectedMachine as any)?.machine_key}`);
 
-      await this.executePhase(sessionId, bePath, dbName, testCases, onLog, onProgress, dbSummary, selectedMachineId);
+      await this.executePhase(sessionId, '/data/NIDOWORKZ/CSND', dbName, testCases, onLog, onProgress, dbSummary, selectedMachine?.id);
+
     } catch (err: any) {
       onLog(`[ERROR] Re-run failed: ${err.message}`);
       await this.inspectraDb.updateSession(sessionId, { status: 'FAILED', completedAt: new Date() });
-      await this.stopServices(sessionId, onLog);
       throw err;
     }
   }
 
-  async analyzeDiscoveredMachines(dbBackupPath: string): Promise<{ totalMachines: number, machines: string[] }> {
+  async analyzeDiscoveredMachines(dbBackupPath: string) {
     if (!dbBackupPath) return { totalMachines: 0, machines: [] };
-
     const tempDbName = `temp_analysis_${Date.now()}`;
     const dbAnalyzer = new DbAnalyzer(this.testDbUri, tempDbName);
-
     try {
-      await this.ensureTestDb(() => { });
+      // await this.ensureTestDb(() => { });  ← DELETE this line
       await dbAnalyzer.restoreBackup(dbBackupPath);
       const summary = await dbAnalyzer.analyze();
-      return {
-        totalMachines: summary.totalMachines,
-        machines: summary.machines.map(m => m.name)
-      };
+      return { totalMachines: summary.totalMachines, machines: summary.machines.map(m => m.name) };
     } catch (err) {
       console.error('DB Discovery failed:', err);
       throw err;
@@ -592,28 +529,35 @@ location /SIM/ {
   }
 
   private async executePhase(
-    sessionId: string, 
-    bePath: string, 
-    dbName: string, 
-    testCases: any[], 
-    onLog: (msg: string) => void, 
-    onProgress?: (step: string, percent: number) => void, 
+    sessionId: string,
+    bePath: string,
+    dbName: string,
+    testCases: any[],
+    onLog: (msg: string) => void,
+    onProgress?: (step: string, percent: number) => void,
     dbSummary?: DbSummary,
-    selectedMachineId?: string    // ← ADD THIS
+    selectedMachineId?: string
   ) {
-    onProgress?.('Executing Tests', 80);
-    await this.spawnServices(bePath, sessionId, onLog, dbSummary, selectedMachineId);
+    onProgress?.('Starting VM Services', 78);
 
-    const baseUri = this.testDbUri.endsWith('/') ? this.testDbUri.slice(0, -1) : this.testDbUri;
-    const sessionMongoUri = `${baseUri}/${dbName}`;
+    // ── Spawn services on VM first ─────────────────────────────────────────
+    const selectedMachine = selectedMachineId
+      ? dbSummary?.machines.find(m => m.id === selectedMachineId)
+      : dbSummary?.machines[0];
 
-    // ✅ Replace with:
-    onLog?.(`[ORCHESTRATOR] Simulation Environment is UP and READY.`);
-    onLog?.(`[ORCHESTRATOR] Services are connected to: ${sessionMongoUri}`);
-
-    // Wait for services to fully boot before running tests
-    onLog?.(`[ORCHESTRATOR] Waiting for services to stabilize...`);
-    await this.waitForServices(onLog);
+    try {
+      onLog?.(`[ORCHESTRATOR] Instructing VM to spawn microservices...`);
+      await emitToInfraWithAck('infra:spawn-services', {
+        sessionId,
+        mongoUri: this.testDbUri,
+        dbName,
+        machineId: selectedMachine?.id || '',
+        machineKey: (selectedMachine as any)?.machine_key || 'MA01',
+      }, 120000);
+      onLog?.(`[ORCHESTRATOR] VM services are up.`);
+    } catch (e: any) {
+      onLog?.(`[WARNING] VM service spawn issue: ${e.message} — proceeding`);
+    }
 
     onProgress?.('Running Tests', 85);
     const runner = new TestRunner(this.testDbUri, this.workspacePath);
@@ -628,7 +572,10 @@ location /SIM/ {
     const failed = results.filter(r => !r.passed).length;
     onLog?.(`[ORCHESTRATOR] ✅ Tests complete: ${passed} passed, ${failed} failed`);
 
-    await this.inspectraDb.updateSession(sessionId, { status: failed === 0 ? 'COMPLETED' : 'FAILED', completedAt: new Date() });
+    await this.inspectraDb.updateSession(sessionId, {
+      status: failed === 0 ? 'COMPLETED' : 'FAILED',
+      completedAt: new Date()
+    });
     onProgress?.('Done', 100);
   }
 
@@ -657,111 +604,15 @@ location /SIM/ {
   }
 
 
-  private async spawnServices(bePath: string, sessionId: string, onLog?: (msg: string) => void, dbSummary?: DbSummary, selectedMachineId?: string) {
-    const appsPath = path.join(bePath, 'apps');
-
-    const baseUri = this.testDbUri.endsWith('/')
-      ? this.testDbUri.slice(0, -1)
-      : this.testDbUri;
-
-    const sessionMongoUri = `${baseUri}/inspectra_csnd_${sessionId}`;
-
-    onLog?.(`[ORCHESTRATOR] Starting services...`);
-
-    for (const service of this.services) {
-      const servicePath = path.join(appsPath, service.name);
-      if (!fs.existsSync(servicePath)) continue;
-
-      // 🛡️ Safety: Ensure app node_modules exist
-      if (!fs.existsSync(path.join(servicePath, 'node_modules'))) {
-        onLog?.(`[ORCHESTRATOR] Installing dependencies for ${service.name}...`);
-        try {
-          await execAsync(`npm install --ignore-scripts`, { cwd: servicePath });
-        } catch (e: any) {
-          onLog?.(`[WARNING] App install failed for ${service.name}: ${e.message}`);
-        }
-      }
-
-      const logFile = path.join(servicePath, 'service.log');
-      const logStream = fs.createWriteStream(logFile, { flags: 'a' });
-
-      const dbPrefix = `inspectra_csnd_${sessionId}`;
-
-      const envVars = {
-        PORT: service.port.toString(),
-        MONGO_URI: sessionMongoUri,
-        MONGODB_URI: sessionMongoUri,
-        NODE_ENV: 'development',
-        SESSION_ID: sessionId,
-        IS_SIMULATION: 'true',
-
-        MONGO_DB: dbPrefix,
-        SORTING_DB: dbPrefix,
-        INCOMING_DB: dbPrefix,
-        MACHINE_CONFIG_DB: dbPrefix,
-        IDENTITY_DB: dbPrefix,
-        CALIBRATION_DB: dbPrefix,
-        NOTIFICATION_DB: dbPrefix,
-        CYCLIC_DB: dbPrefix,
-        UPLOADER_DB: dbPrefix,
-      };
-
-      if (service.name === 'app-device-interface' && (dbSummary?.machines?.length ?? 0) > 0) {
-        const tcpMachine = (selectedMachineId 
-          ? dbSummary!.machines.find(m => m.id === selectedMachineId)
-          : null)
-          || dbSummary!.machines.find(m => m.name?.toLowerCase().includes('astro'))
-          || dbSummary!.machines[0];
-
-        const machineKey = (tcpMachine as any).machine_key || 'MA01';
-
-        // MACHINE_ID = the actual MongoDB _id (what app-device-interface queries by)
-        // MACHINE_KEY = the protocol key (what goes into TCP packet strings)
-        (envVars as any)['MACHINE_ID'] = tcpMachine.id;        // ← o1da5720-d2ee-4c8a-be37-43f216acc098
-        (envVars as any)['MACHINE_KEY'] = machineKey;           // ← MA01
-        
-        onLog?.(`[ORCHESTRATOR] ADI machine: ${tcpMachine.name} | _id: ${tcpMachine.id} | key: ${machineKey}`);
-      }
-
-      fs.writeFileSync(
-        path.join(servicePath, '.env'),
-        Object.entries(envVars)
-          .map(([k, v]) => `${k}=${v}`)
-          .join('\n')
-      );
-
-      onLog?.(`➡ Starting ${service.name}...`);
-
-      const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-      const child = spawn('npm', ['run', 'dev'], {
-        cwd: servicePath,
-        env: { ...process.env, ...envVars },
-        shell: true,
-        windowsHide: true   // suppress console popups per service
-      });
-
-      child.stdout?.on('data', (data) => {
-        const msg = data.toString();
-        onLog?.(`[${service.name}] ${msg}`);
-        logStream.write(msg);
-      });
-
-      child.stderr?.on('data', (data) => {
-        const msg = data.toString();
-        onLog?.(`[${service.name} ERROR] ${msg}`);
-        logStream.write(msg);
-      });
-
-      let sessionProcesses = this.runningProcesses.get(sessionId) || [];
-      sessionProcesses.push(child);
-      this.runningProcesses.set(sessionId, sessionProcesses);
-
-      service.status = 'UP';
-
-      await new Promise(res => setTimeout(res, 4000));
-    }
-
-    onLog?.(`✅ All services started`);
+  private async spawnServices(
+    _bePath: string,
+    sessionId: string,
+    onLog?: (msg: string) => void,
+    dbSummary?: DbSummary,
+    selectedMachineId?: string
+  ) {
+    // Services run on the VM. This is now handled via infra:spawn-services socket event.
+    onLog?.(`[ORCHESTRATOR] Services are running on VM (delegated to infra-node)`);
   }
 
   private async stopServices(sessionId: string, onLog?: (msg: string) => void) {
@@ -794,47 +645,4 @@ location /SIM/ {
       } catch (e) { }
     }
   }
-  private async waitForServices(onLog?: (msg: string) => void, timeoutMs: number = 60000): Promise<void> {
-  const serviceChecks = [
-    { name: 'app-device-interface', url: `http://127.0.0.1:5500/health` },
-    { name: 'validation-engine',    url: `http://127.0.0.1:5000/health` },
-    { name: 'incoming-service',     url: `http://127.0.0.1:7002/health` },
-    { name: 'mapper-service',       url: `http://127.0.0.1:4000/health` },
-    { name: 'dataposting-service',  url: `http://127.0.0.1:4100/health` },
-  ];
-
-  const startTime = Date.now();
-  const pollIntervalMs = 3000;
-
-  onLog?.(`[ORCHESTRATOR] Polling ${serviceChecks.length} services for readiness...`);
-
-  while (Date.now() - startTime < timeoutMs) {
-    const results = await Promise.all(
-      serviceChecks.map(async (svc) => {
-        try {
-          const res = await axios.get(svc.url, { timeout: 2000 });
-          return { name: svc.name, up: res.status < 500 };
-        } catch {
-          return { name: svc.name, up: false };
-        }
-      })
-    );
-
-    const allUp = results.every(r => r.up);
-    const upNames = results.filter(r => r.up).map(r => r.name);
-    const downNames = results.filter(r => !r.up).map(r => r.name);
-
-    onLog?.(`[ORCHESTRATOR] Services UP: [${upNames.join(', ')}] | DOWN: [${downNames.join(', ')}]`);
-
-    if (allUp) {
-      onLog?.(`[ORCHESTRATOR] ✅ All services ready — starting simulation`);
-      return;
-    }
-
-    await new Promise(r => setTimeout(r, pollIntervalMs));
-  }
-
-  // Timeout reached — log warning but proceed anyway
-  onLog?.(`[ORCHESTRATOR] ⚠️ Timeout waiting for services — proceeding anyway`);
-}
 }
