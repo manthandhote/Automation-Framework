@@ -45,11 +45,11 @@ export class LlamaAnalyst {
   // ─── Core request helper ─────────────────────────────────────────────────────
   private async ask(prompt: string, expectJson: boolean = true, retries: number = 3): Promise<string> {
     const timeout = Number(process.env.LLM_TIMEOUT_MS) || 300000;
-    
+
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {
         logger.info(`[AI] Attempt ${attempt}/${retries} — sending prompt (${prompt.length} chars)...`, 'AI');
-        
+
         const response = await axios.post(this.endpoint, {
           model: this.model,
           prompt,
@@ -233,10 +233,10 @@ Return plain text only, no JSON, no markdown.`;
     ${awbContext}
 
     MACHINES:
-    ${JSON.stringify(dbSummary.machines.map(m => ({ 
-      name: m.name, 
+    ${JSON.stringify(dbSummary.machines.map(m => ({
+      name: m.name,
       type: m.type,
-      machine_key: (m as any).machine_key 
+      machine_key: (m as any).machine_key
     })), null, 2)}
 
     MICROSERVICES:
@@ -274,13 +274,29 @@ Return plain text only, no JSON, no markdown.`;
 
     try {
       const text = await this.ask(prompt);
-      const cases: GeneratedTestCase[] = JSON.parse(text);
+      let cleaned = text.trim();
+
+      // Remove markdown
+      cleaned = cleaned
+        .replace(/```json/gi, '')
+        .replace(/```/g, '')
+        .trim();
+
+      // Fix unquoted UUID machineId values
+      cleaned = cleaned.replace(
+        /"machineId"\s*:\s*([a-zA-Z0-9-]{20,})/g,
+        '"machineId": "$1"'
+      );
+
+      logger.info(`[AI] Cleaned response:\n${cleaned}`, 'AI');
+
+      const cases: GeneratedTestCase[] = JSON.parse(cleaned);
       logger.info(`Generated ${cases.length} test cases`, 'AI');
 
       // ── CRITICAL SAFETY VALIDATION ──
       // Reject any case where LLM invented a barcode not in our known set
       const knownAwbs = new Set(realAwbs?.flatMap(ctx => [ctx.validAwb, ctx.fakeAwb, 'INVALID000'].filter(Boolean)));
-      
+
       const validatedCases = cases.filter(tc => {
         if (!tc.barcode) return false;
         if (knownAwbs.size > 0 && !knownAwbs.has(tc.barcode)) {
@@ -324,7 +340,7 @@ Return plain text only, no JSON, no markdown.`;
           machineName: ctx.machineKey,
           machineId: ctx.machineId,
           configName: 'normal_flow',
-          isDuplicate: false,   
+          isDuplicate: false,
           dims: { l: 187, b: 172, h: 47 },  // real values from your machine config
           weight: 0.12
         });

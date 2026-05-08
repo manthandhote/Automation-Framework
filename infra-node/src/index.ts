@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { io, Socket } from 'socket.io-client';
 import os from 'os';
 import { Installer } from './installer';
@@ -13,7 +14,7 @@ logger.info(`Connecting to AUTOMYRIX at ${ORCHESTRATOR_URL}...`);
 
 socket.on('connect', async () => {
   logger.info('Connected to AUTOMYRIX Orchestrator.');
-  
+
   // Phase 2: Infra Discovery - Send VM info
   const vmInfo = {
     hostname: os.hostname(),
@@ -23,13 +24,13 @@ socket.on('connect', async () => {
     totalMem: Math.round(os.totalmem() / 1024 / 1024),
     freeMem: Math.round(os.freemem() / 1024 / 1024)
   };
-  
+
   socket.emit('infra:register', vmInfo);
-  
+
   // Verify Nginx / PHP
   const nginxStatus = await Installer.checkAndInstallNginx();
   const phpStatus = await Installer.checkAndInstallPhp();
-  
+
   socket.emit('infra:status', {
     nginx: nginxStatus ? 'running' : 'not running',
     php: phpStatus ? 'installed' : 'not installed',
@@ -48,22 +49,50 @@ socket.on('infra:stop-service', (data: { serviceName: string }) => {
   socket.emit('infra:service-status', { serviceName: data.serviceName, status: success ? 'DOWN' : 'FAILED' });
 });
 
+socket.on(
+  'infra:setup-project',
+  async (
+    data: { backendRepoUrl: string; frontendRepoUrl: string },
+    callback: Function
+  ) => {
+    logger.info('Received infra:setup-project command.');
+
+    const result = await Installer.setupProjectRepos(
+      data.backendRepoUrl,
+      data.frontendRepoUrl,
+      (msg: string) => {
+        logger.info(`[setup] ${msg}`);
+
+        socket.emit('setup:progress', { message: msg });
+      }
+    );
+
+    if (callback) callback(result);
+
+    socket.emit('infra:setup-status', {
+      success: result.success,
+      error: result.error ?? null,
+      dashboardUrl: result.success ? 'http://127.0.0.1:7001' : null,
+    });
+  }
+);
+
 socket.on('infra:simulate-cycle', async (data: any, callback: Function) => {
   logger.info(`Simulating cycle for ${data.barcode} on ${data.machineKey} (${data.protocol})`);
   try {
     const simulator = new MachineSimulator(data.transport, data.options);
-    
+
     // Stream packets back to orchestrator
     simulator.on('packet', (packetStr) => {
       socket.emit('simulator:packet', { data: packetStr });
     });
 
     const result = await simulator.runFullCycle(
-      data.barcode, 
-      data.machineKey, 
-      data.protocol, 
-      data.dims, 
-      data.weight, 
+      data.barcode,
+      data.machineKey,
+      data.protocol,
+      data.dims,
+      data.weight,
       data.edgeProfile
     );
     if (callback) callback({ success: true, result });
