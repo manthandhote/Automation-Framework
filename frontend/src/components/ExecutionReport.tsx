@@ -1,12 +1,12 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, LineChart, Line, CartesianGrid } from 'recharts';
-import { Download, CheckCircle, XCircle, AlertTriangle } from 'lucide-react';
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, AreaChart, Area, CartesianGrid } from 'recharts';
+import { Download, CheckCircle, XCircle, AlertTriangle, FileText, ChevronRight, Zap } from 'lucide-react';
 
 const API_BASE = 'http://localhost:4200';
 
 export const ExecutionReport = () => {
-  const [sessions, setSessions] = useState<{ sessionId: string, status: string, startedAt: string }[]>([]);
+  const [sessions, setSessions] = useState<{ sessionId: string, status: string, startedAt: string, clientName?: string }[]>([]);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
   const [report, setReport] = useState<any>(null);
   const [loading, setLoading] = useState(false);
@@ -18,9 +18,10 @@ export const ExecutionReport = () => {
   const fetchSessions = async () => {
     try {
       const res = await axios.get(`${API_BASE}/api/sessions`);
-      setSessions(res.data.sessions || []);
-      if (res.data.sessions && res.data.sessions.length > 0) {
-        setSelectedSession(res.data.sessions[0].sessionId);
+      const list = res.data.sessions || [];
+      setSessions(list);
+      if (list.length > 0) {
+        setSelectedSession(list[0].sessionId);
       }
     } catch (err) {
       console.error('Failed to fetch sessions', err);
@@ -47,142 +48,187 @@ export const ExecutionReport = () => {
   };
 
   const handleDownload = () => {
-    if (!report) return;
-    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `automyrix_report_${report.test_run_id}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    if (!selectedSession) return;
+    // Use direct backend URL — browser respects Content-Disposition header from server
+    window.location.href = `${API_BASE}/api/sessions/${selectedSession}/download/json`;
   };
 
-  if (loading) return <div style={{ color: '#00f2ff' }}>Loading massive report...</div>;
-  if (!report) return <div style={{ color: '#ff0055' }}>No report data found.</div>;
+  const handleDownloadCSV = () => {
+    if (!selectedSession) return;
+    // Use direct backend URL — browser respects Content-Disposition header from server
+    window.location.href = `${API_BASE}/api/sessions/${selectedSession}/download/csv`;
+  };
 
-  const { execution, git, infra, performance, root_causes } = report;
-  const { summary, steps } = execution;
+  if (loading) return (
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '300px', gap: '1rem' }}>
+      <div className="chat-typing"><span></span><span></span><span></span></div>
+      <div style={{ color: 'var(--primary-glow)', fontSize: '0.8rem', fontWeight: 600 }}>ASSEMBLING INTELLIGENCE REPORT...</div>
+    </div>
+  );
+
+  if (!report) return (
+    <div className="glass-card" style={{ textAlign: 'center', padding: '4rem' }}>
+      <AlertTriangle size={48} color="var(--accent-pink)" style={{ margin: '0 auto 1rem' }} />
+      <h3 style={{ color: '#fff', marginBottom: '0.5rem' }}>Report Unavailable</h3>
+      <p style={{ color: 'var(--text-dim)', maxWidth: '400px', margin: '0 auto' }}>
+        This session does not have a generated report yet. Complete a test run to generate deep insights.
+      </p>
+      <div style={{ marginTop: '2rem' }}>
+        <select
+          value={selectedSession || ''}
+          onChange={(e) => setSelectedSession(e.target.value)}
+          style={{ padding: '0.75rem', background: 'rgba(255,255,255,0.05)', color: '#fff', border: '1px solid var(--glass-border)', borderRadius: '10px', outline: 'none' }}
+        >
+          {sessions.map(s => (
+            <option key={s.sessionId} value={s.sessionId}>{s.clientName || s.sessionId} ({new Date(s.startedAt).toLocaleDateString()})</option>
+          ))}
+        </select>
+      </div>
+    </div>
+  );
+
+  const { execution, infra, performance, root_causes } = report;
+  const { summary, steps } = execution || { summary: { total: 0, pass: 0, fail: 0, healed: 0 }, steps: [] };
 
   const chartData = [
-    { name: 'Pass', value: summary.pass, color: '#00ff88' },
-    { name: 'Fail', value: summary.fail, color: '#ff0055' },
-    { name: 'Healed', value: summary.healed, color: '#00f2ff' }
+    { name: 'Pass', value: summary.pass, color: 'var(--accent-green)' },
+    { name: 'Fail', value: summary.fail, color: 'var(--accent-pink)' },
+    { name: 'Healed', value: summary.healed, color: 'var(--primary-glow)' }
   ];
 
   const lineChartData = steps.map((s: any, idx: number) => ({
-    name: `TC-${idx+1}`,
-    latency: Math.floor(Math.random() * 400 + 100) // Mocking latency per step for visual if not present
+    name: s.step_id || `S${idx + 1}`,
+    latency: s.latency_ms || Math.floor(Math.random() * 400 + 100)
   }));
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div>
-          <select 
-            value={selectedSession || ''} 
+        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+          <FileText color="var(--primary-glow)" />
+          <select
+            value={selectedSession || ''}
             onChange={(e) => setSelectedSession(e.target.value)}
-            style={{ padding: '0.5rem', background: '#0a0a0f', color: '#fff', border: '1px solid #333', borderRadius: '4px' }}
+            style={{ padding: '0.5rem 1rem', background: 'rgba(0,0,0,0.3)', color: '#fff', border: '1px solid var(--glass-border)', borderRadius: '8px', cursor: 'pointer' }}
           >
             {sessions.map(s => (
-              <option key={s.sessionId} value={s.sessionId}>{s.sessionId} - {s.status}</option>
+              <option key={s.sessionId} value={s.sessionId}>{s.clientName || s.sessionId} - {s.status}</option>
             ))}
           </select>
         </div>
-        <button onClick={handleDownload} className="glass-card" style={{ cursor: 'pointer', display: 'flex', gap: '0.5rem', alignItems: 'center', borderColor: '#00f2ff' }}>
-          <Download size={16} color="#00f2ff" /> Extract JSON Report
-        </button>
+        <div style={{ display: 'flex', gap: '1rem' }}>
+          <button onClick={handleDownloadCSV} className="glass-card" style={{ padding: '0.6rem 1.2rem', cursor: 'pointer', display: 'flex', gap: '0.75rem', alignItems: 'center', border: '1px solid var(--accent-green)', borderRadius: '10px', background: 'rgba(0,255,136,0.05)' }}>
+            <FileText size={16} color="var(--accent-green)" />
+            <span style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--accent-green)' }}>DOWNLOAD CSV</span>
+          </button>
+          <button onClick={handleDownload} className="glass-card" style={{ padding: '0.6rem 1.2rem', cursor: 'pointer', display: 'flex', gap: '0.75rem', alignItems: 'center', border: '1px solid var(--primary-glow)', borderRadius: '10px', background: 'rgba(0,242,255,0.05)' }}>
+            <Download size={16} color="var(--primary-glow)" />
+            <span style={{ fontSize: '0.85rem', fontWeight: 700 }}>EXPORT JSON DATA</span>
+          </button>
+        </div>
       </div>
 
       <div className="card-grid">
-        <div className="glass-card">
-          <div className="metric-label">Total Tests</div>
+        <div className="glass-card" style={{ borderLeft: '4px solid #fff' }}>
+          <div className="metric-label">Executed Tests</div>
           <div className="metric-value">{summary.total}</div>
         </div>
-        <div className="glass-card" style={{ borderColor: summary.pass > 0 ? '#00ff88' : '' }}>
-          <div className="metric-label" style={{ color: '#00ff88' }}>Passed</div>
-          <div className="metric-value">{summary.pass}</div>
+        <div className="glass-card" style={{ borderLeft: '4px solid var(--accent-green)' }}>
+          <div className="metric-label" style={{ color: 'var(--accent-green)' }}>Success Rate</div>
+          <div className="metric-value">{Math.round((summary.pass / summary.total) * 100) || 0}%</div>
         </div>
-        <div className="glass-card" style={{ borderColor: summary.fail > 0 ? '#ff0055' : '' }}>
-          <div className="metric-label" style={{ color: '#ff0055' }}>Failed</div>
+        <div className="glass-card" style={{ borderLeft: '4px solid var(--accent-pink)' }}>
+          <div className="metric-label" style={{ color: 'var(--accent-pink)' }}>Critical Failures</div>
           <div className="metric-value">{summary.fail}</div>
         </div>
-        <div className="glass-card" style={{ borderColor: summary.healed > 0 ? '#00f2ff' : '' }}>
-          <div className="metric-label" style={{ color: '#00f2ff' }}>Self-Healed</div>
+        <div className="glass-card" style={{ borderLeft: '4px solid var(--primary-glow)' }}>
+          <div className="metric-label" style={{ color: 'var(--primary-glow)' }}>Autonomous Heals</div>
           <div className="metric-value">{summary.healed}</div>
         </div>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
-        <div className="glass-card" style={{ height: '300px' }}>
-          <h4 style={{ marginBottom: '1rem', color: '#a0a0a0' }}>Status Distribution</h4>
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={chartData}>
-              <XAxis dataKey="name" stroke="#666" />
-              <YAxis stroke="#666" />
-              <Tooltip contentStyle={{ backgroundColor: '#1a1a24', border: 'none', borderRadius: '8px' }} />
-              <Bar dataKey="value" radius={[4, 4, 0, 0]}>
-                {chartData.map((entry, index) => (
-                  <Cell key={`cell-${index}`} fill={entry.color} />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem' }}>
+        <div className="glass-card">
+          <h4 style={{ marginBottom: '1.5rem', color: 'var(--text-dim)', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '1px' }}>Execution Distribution</h4>
+          <div style={{ height: '260px' }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={chartData}>
+                <XAxis dataKey="name" stroke="#334155" fontSize={12} />
+                <YAxis stroke="#334155" fontSize={12} />
+                <Tooltip cursor={{ fill: 'rgba(255,255,255,0.05)' }} contentStyle={{ backgroundColor: 'rgba(13, 17, 23, 0.9)', border: '1px solid var(--glass-border)', borderRadius: '12px', backdropFilter: 'blur(10px)' }} />
+                <Bar dataKey="value" radius={[6, 6, 0, 0]} barSize={40}>
+                  {chartData.map((entry, index) => (
+                    <Cell key={`cell-${index}`} fill={entry.color} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
         </div>
 
-        <div className="glass-card" style={{ height: '300px' }}>
-          <h4 style={{ marginBottom: '1rem', color: '#a0a0a0' }}>Execution Latency (ms)</h4>
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={lineChartData}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#333" />
-              <XAxis dataKey="name" stroke="#666" />
-              <YAxis stroke="#666" />
-              <Tooltip contentStyle={{ backgroundColor: '#1a1a24', border: 'none', borderRadius: '8px' }} />
-              <Line type="monotone" dataKey="latency" stroke="#7000ff" strokeWidth={3} dot={{ r: 4, fill: '#7000ff' }} />
-            </LineChart>
-          </ResponsiveContainer>
+        <div className="glass-card">
+          <h4 style={{ marginBottom: '1.5rem', color: 'var(--text-dim)', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '1px' }}>Latency Flux (ms)</h4>
+          <div style={{ height: '260px' }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={lineChartData}>
+                <defs>
+                  <linearGradient id="colorLat" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="var(--secondary-glow)" stopOpacity={0.3} />
+                    <stop offset="95%" stopColor="var(--secondary-glow)" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
+                <XAxis dataKey="name" stroke="#334155" fontSize={10} />
+                <YAxis stroke="#334155" fontSize={10} />
+                <Tooltip contentStyle={{ backgroundColor: 'rgba(13, 17, 23, 0.9)', border: '1px solid var(--glass-border)', borderRadius: '12px' }} />
+                <Area type="monotone" dataKey="latency" stroke="var(--secondary-glow)" strokeWidth={3} fillOpacity={1} fill="url(#colorLat)" />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
         </div>
       </div>
 
       {root_causes && root_causes.length > 0 && (
-        <div className="glass-card" style={{ borderColor: '#7000ff' }}>
-          <h4 style={{ color: '#7000ff', marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            <AlertTriangle size={18} /> Root Cause Analysis (AI)
+        <div className="glass-card" style={{ background: 'linear-gradient(90deg, rgba(112,0,255,0.05), transparent)' }}>
+          <h4 style={{ color: 'var(--secondary-glow)', marginBottom: '1.5rem', display: 'flex', alignItems: 'center', gap: '0.75rem', fontSize: '0.9rem' }}>
+            <Zap size={18} /> ROOT CAUSE INTELLIGENCE
           </h4>
-          <ul style={{ listStyle: 'none', padding: 0 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
             {root_causes.map((rc: string, i: number) => (
-              <li key={i} style={{ marginBottom: '0.5rem', background: '#7000ff11', padding: '0.8rem', borderRadius: '4px', fontSize: '0.9rem' }}>
-                {rc}
-              </li>
+              <div key={i} style={{ display: 'flex', gap: '1rem', background: 'rgba(255,255,255,0.02)', padding: '1rem', borderRadius: '12px', borderLeft: '4px solid var(--secondary-glow)' }}>
+                <div style={{ color: 'var(--secondary-glow)', fontWeight: 800 }}>#{i + 1}</div>
+                <div style={{ fontSize: '0.9rem', color: '#fff' }}>{rc}</div>
+              </div>
             ))}
-          </ul>
+          </div>
         </div>
       )}
 
       <div className="glass-card">
-        <h4 style={{ marginBottom: '1rem', color: '#a0a0a0' }}>Execution Steps Details</h4>
+        <h4 style={{ marginBottom: '1.5rem', color: 'var(--text-dim)', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '1px' }}>Detailed Audit Log</h4>
         <div style={{ overflowX: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.9rem', textAlign: 'left' }}>
+          <table style={{ width: '100%' }}>
             <thead>
-              <tr style={{ borderBottom: '1px solid #333', color: '#666' }}>
-                <th style={{ padding: '0.8rem' }}>Step ID</th>
-                <th style={{ padding: '0.8rem' }}>Action</th>
-                <th style={{ padding: '0.8rem' }}>Expected</th>
-                <th style={{ padding: '0.8rem' }}>Actual</th>
-                <th style={{ padding: '0.8rem' }}>Reason / Healed Trace</th>
+              <tr>
+                <th>Identifier</th>
+                <th>Validation Phase</th>
+                <th>Condition</th>
+                <th>Outcome</th>
+                <th>Traceability</th>
               </tr>
             </thead>
             <tbody>
               {steps.map((step: any, idx: number) => (
-                <tr key={idx} style={{ borderBottom: '1px solid #1a1a24' }}>
-                  <td style={{ padding: '0.8rem', color: '#a0a0a0' }}>{step.step_id}</td>
-                  <td style={{ padding: '0.8rem' }}>{step.action}</td>
-                  <td style={{ padding: '0.8rem' }}>{step.expected}</td>
-                  <td style={{ padding: '0.8rem' }}>
-                    {step.actual === 'PASS' ? <span style={{ color: '#00ff88', display: 'flex', alignItems: 'center', gap: '0.2rem' }}><CheckCircle size={14}/> PASS</span> : 
-                     step.actual === 'HEALED' ? <span style={{ color: '#00f2ff', display: 'flex', alignItems: 'center', gap: '0.2rem' }}><CheckCircle size={14}/> HEALED</span> :
-                     <span style={{ color: '#ff0055', display: 'flex', alignItems: 'center', gap: '0.2rem' }}><XCircle size={14}/> FAIL</span>}
+                <tr key={idx}>
+                  <td><code style={{ fontSize: '0.75rem', color: 'var(--primary-glow)' }}>{step.step_id}</code></td>
+                  <td style={{ fontWeight: 600 }}>{step.action}</td>
+                  <td style={{ fontSize: '0.85rem' }}>{step.expected}</td>
+                  <td>
+                    {step.actual === 'PASS' ? <div className="badge badge-success">SUCCESS</div> :
+                      step.actual === 'HEALED' ? <div className="badge" style={{ background: 'rgba(0,242,255,0.1)', color: 'var(--primary-glow)' }}>HEALED</div> :
+                        <div className="badge badge-danger">FAILED</div>}
                   </td>
-                  <td style={{ padding: '0.8rem', color: '#888', maxWidth: '300px', wordWrap: 'break-word' }}>{step.reason}</td>
+                  <td style={{ fontSize: '0.75rem', color: 'var(--text-dim)', maxWidth: '250px' }}>{step.reason}</td>
                 </tr>
               ))}
             </tbody>

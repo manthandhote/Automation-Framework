@@ -381,22 +381,27 @@ export function SetupChat() {
   return (
     <div className="setup-chat-wrapper">
       {/* Branding Header */}
-      <div className="automyrix-header" style={{
+      <div style={{
         display: 'flex',
         alignItems: 'center',
-        padding: '1rem',
-        borderBottom: '1px solid rgba(255,255,255,0.1)',
-        background: 'rgba(10,10,15,0.8)',
-        backdropFilter: 'blur(10px)',
+        padding: '1.25rem 1.5rem',
+        borderBottom: '1px solid var(--glass-border)',
+        background: 'rgba(13, 17, 23, 0.4)',
+        backdropFilter: 'blur(20px)',
         gap: '1rem'
       }}>
-        <img src="/Automyrix-logo.png" alt="Automyrix" style={{ height: '32px' }} />
+        <div style={{ 
+          width: '32px', height: '32px', background: 'var(--primary-glow)', borderRadius: '8px',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 15px rgba(0, 242, 255, 0.3)'
+        }}>
+          <Bot size={20} color="#000" />
+        </div>
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-            <div style={{ fontSize: '1rem', fontWeight: 700, letterSpacing: '1px', color: 'var(--primary-glow)' }}>Automyrix Control</div>
-            <div style={{ fontSize: '0.6rem', padding: '2px 6px', background: 'rgba(0,242,255,0.1)', borderRadius: '4px', color: 'var(--primary-glow)', fontWeight: 600, border: '1px solid rgba(0,242,255,0.2)' }}>v1.0.0</div>
+            <div style={{ fontSize: '1.1rem', fontWeight: 800, letterSpacing: '0.5px', color: '#fff' }}>Setup Intelligence</div>
+            <div className="badge badge-warning" style={{ fontSize: '0.6rem', padding: '2px 8px' }}>NEURAL ENGINE v1.0</div>
           </div>
-          {/* <div style={{ fontSize: '0.65rem', opacity: 0.5, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Control</div> */}
+          <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', fontWeight: 500 }}>Configuring Autonomous Testing Environment</div>
         </div>
       </div>
 

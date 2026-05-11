@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
-import { Clock, CheckCircle, XCircle, AlertCircle, ChevronDown, ChevronUp, FlaskConical, BarChart3, RefreshCw } from 'lucide-react';
+import { Clock, CheckCircle, XCircle, AlertCircle, ChevronDown, ChevronUp, FlaskConical, BarChart3, RefreshCw, Cpu, Database, Zap } from 'lucide-react';
 
 const API_BASE = 'http://localhost:4200';
 
@@ -58,7 +58,7 @@ export function SessionHistory() {
 
   useEffect(() => {
     fetchSessions();
-    const interval = setInterval(fetchSessions, 10000); // poll for running sessions
+    const interval = setInterval(fetchSessions, 10000);
     return () => clearInterval(interval);
   }, []);
 
@@ -67,7 +67,6 @@ export function SessionHistory() {
     if (!confirm('Re-run this session? Existing results will be updated.')) return;
     try {
       await axios.post(`${API_BASE}/api/sessions/${sessionId}/rerun`);
-      alert('Re-run started! Check the engine logs or refresh history in a few minutes.');
       fetchSessions();
     } catch (err: any) {
       alert('Failed to start re-run: ' + err.message);
@@ -90,7 +89,6 @@ export function SessionHistory() {
     }
     setExpanded(sessionId);
 
-    // Fetch in parallel
     const [casesRes, resultsRes, sessionRes] = await Promise.allSettled([
       axios.get(`${API_BASE}/api/sessions/${sessionId}/test-cases`),
       axios.get(`${API_BASE}/api/sessions/${sessionId}/results`),
@@ -116,11 +114,24 @@ export function SessionHistory() {
     return <span className="session-badge running"><AlertCircle size={12} className="pulse-primary" /> Running</span>;
   };
 
+  // CORRECTED Pass Rate Logic: Compare actual status with expected status
   const passRate = (sid: string) => {
     const r = results[sid];
-    if (!r || r.length === 0) return null;
-    const passed = r.filter(x => x.status === 'PASS').length;
-    const pct    = Math.round((passed / r.length) * 100);
+    const c = testCases[sid];
+    if (!r || r.length === 0 || !c) return null;
+
+    let passed = 0;
+    r.forEach(res => {
+       const tc = c.find(x => x.testId === res.testId);
+       if (tc) {
+          // If actual matches expected, it's a pass for the test case
+          if (res.status === tc.expectedStatus) passed++;
+       } else if (res.status === 'PASS') {
+          passed++; // fallback
+       }
+    });
+
+    const pct = Math.round((passed / r.length) * 100);
     return { passed, total: r.length, pct };
   };
 
@@ -128,20 +139,13 @@ export function SessionHistory() {
     return <div style={{ color: 'var(--text-dim)', padding: '2rem', textAlign: 'center' }}>Loading session history...</div>;
   }
 
-  if (sessions.length === 0) {
-    return (
-      <div className="glass-card" style={{ textAlign: 'center', padding: '3rem' }}>
-        <FlaskConical size={40} color="var(--text-dim)" style={{ margin: '0 auto 1rem' }} />
-        <p style={{ color: 'var(--text-dim)' }}>No sessions yet. Complete a setup run to see history here.</p>
-      </div>
-    );
-  }
-
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
-        <h3 style={{ color: 'var(--primary-glow)' }}>Session History</h3>
-        <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>{sessions.length} total runs</span>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <h3 style={{ fontSize: '1.5rem', fontWeight: 700 }}>Execution Logs</h3>
+        <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)', background: 'rgba(255,255,255,0.05)', padding: '4px 12px', borderRadius: '20px' }}>
+          {sessions.length} sessions tracked
+        </span>
       </div>
 
       {sessions.map(s => {
@@ -150,141 +154,114 @@ export function SessionHistory() {
         const detail = activeDetail[s.sessionId] || 'cases';
 
         return (
-          <div key={s.sessionId} className="glass-card session-card">
-            {/* Header row */}
-            <div className="session-header" onClick={() => loadSessionDetail(s.sessionId)}>
+          <div key={s.sessionId} className="glass-card" style={{ padding: '0' }}>
+            <div 
+              style={{ padding: '1.5rem', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+              onClick={() => loadSessionDetail(s.sessionId)}
+            >
               <div style={{ flex: 1 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
-                  <span style={{ fontWeight: 700, fontSize: '1rem' }}>{s.clientName}</span>
-                  {statusBadge(s.status)}
-                  {rate && (
-                    <span style={{ fontSize: '0.8rem', color: rate.pct >= 80 ? '#00ff88' : '#ffcc00' }}>
-                      {rate.passed}/{rate.total} passed ({rate.pct}%)
-                    </span>
-                  )}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '0.75rem' }}>
+                   <span style={{ fontSize: '1.1rem', fontWeight: 800 }}>{s.clientName}</span>
+                   {statusBadge(s.status)}
+                   {rate && (
+                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <div style={{ width: '100px', height: '6px', background: 'rgba(255,255,255,0.05)', borderRadius: '3px', overflow: 'hidden' }}>
+                           <div style={{ width: `${rate.pct}%`, height: '100%', background: rate.pct === 100 ? 'var(--accent-green)' : 'var(--accent-gold)' }} />
+                        </div>
+                        <span style={{ fontSize: '0.75rem', fontWeight: 600, color: rate.pct === 100 ? 'var(--accent-green)' : 'var(--accent-gold)' }}>
+                           {rate.passed}/{rate.total} PASSED
+                        </span>
+                     </div>
+                   )}
                 </div>
-                <div style={{ fontSize: '0.75rem', color: 'var(--text-dim)', marginTop: '0.3rem', display: 'flex', gap: '1.5rem', flexWrap: 'wrap' }}>
-                  <span><Clock size={10} style={{ marginRight: '4px' }} />{new Date(s.startedAt).toLocaleString()}</span>
-                  <span>Branch: <code style={{ color: 'var(--primary-glow)' }}>{s.beBranch}</code></span>
-                  <span>Machines: {s.machineCount || '—'}</span>
-                  {s.restoredDbName && <span>DB: <code style={{ color: '#ffcc00', fontSize: '0.7rem' }}>{s.restoredDbName}</code></span>}
+                <div style={{ display: 'flex', gap: '2rem', fontSize: '0.75rem', color: 'var(--text-dim)' }}>
+                   <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Clock size={14} /> {new Date(s.startedAt).toLocaleString()}</div>
+                   <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Zap size={14} color="var(--primary-glow)" /> {s.beBranch}</div>
+                   <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Database size={14} color="var(--accent-gold)" /> {s.restoredDbName || 'standard_csnd'}</div>
                 </div>
-                <div style={{ fontSize: '0.72rem', color: 'var(--text-dim)', marginTop: '0.2rem', opacity: 0.7 }}>ID: {s.sessionId}</div>
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-                <button 
-                  className="rerun-btn" 
-                  onClick={(e) => handleRerun(e, s.sessionId)}
-                  title="Re-run Session"
-                >
-                  <RefreshCw size={14} />
-                </button>
-                <div style={{ color: 'var(--text-dim)' }}>
-                  {isOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
-                </div>
+              
+              <div style={{ display: 'flex', alignItems: 'center', gap: '1.5rem' }}>
+                 <button className="rerun-btn" onClick={(e) => handleRerun(e, s.sessionId)}>
+                    <RefreshCw size={14} />
+                 </button>
+                 {isOpen ? <ChevronUp size={20} /> : <ChevronDown size={20} />}
               </div>
             </div>
 
-            {/* Expanded detail */}
             {isOpen && (
-              <div style={{ marginTop: '1rem', borderTop: '1px solid var(--glass-border)', paddingTop: '1rem' }}>
-                {/* Tab switcher */}
-                <div className="session-tabs">
+              <div style={{ padding: '0 1.5rem 1.5rem', borderTop: '1px solid var(--glass-border)', background: 'rgba(0,0,0,0.1)' }}>
+                <div className="session-tabs" style={{ margin: '1rem 0' }}>
                   <button className={`session-tab ${detail === 'cases' ? 'active' : ''}`} onClick={() => setActiveDetail(p => ({ ...p, [s.sessionId]: 'cases' }))}>
-                    <FlaskConical size={12} /> Test Cases ({testCases[s.sessionId]?.length || 0})
+                    <FlaskConical size={14} /> Scenarios ({testCases[s.sessionId]?.length || 0})
                   </button>
                   <button className={`session-tab ${detail === 'results' ? 'active' : ''}`} onClick={() => setActiveDetail(p => ({ ...p, [s.sessionId]: 'results' }))}>
-                    <BarChart3 size={12} /> Results ({results[s.sessionId]?.length || 0})
+                    <BarChart3 size={14} /> Live Results ({results[s.sessionId]?.length || 0})
                   </button>
                   <button className={`session-tab ${detail === 'analysis' ? 'active' : ''}`} onClick={() => setActiveDetail(p => ({ ...p, [s.sessionId]: 'analysis' }))}>
-                    AI Analysis
+                    <Cpu size={14} /> AI Context
                   </button>
                 </div>
 
-                {/* Test Cases */}
                 {detail === 'cases' && (
-                  <div style={{ marginTop: '0.75rem' }}>
-                    {!testCases[s.sessionId]?.length
-                      ? <p style={{ color: 'var(--text-dim)', fontSize: '0.85rem' }}>No test cases found.</p>
-                      : <div className="tc-table">
-                          <div className="tc-row tc-header">
-                            <span>ID</span><span>Service</span><span>Scenario</span><span>Machine</span><span>Expected</span><span>Source</span>
-                          </div>
-                          {testCases[s.sessionId].map(tc => (
-                            <div key={tc.testId} className="tc-row">
-                              <code style={{ color: 'var(--primary-glow)', fontSize: '0.75rem' }}>{tc.testId}</code>
-                              <span>{tc.service}</span>
-                              <span style={{ color: 'var(--text-dim)', fontSize: '0.8rem' }}>{tc.scenario}</span>
-                              <span style={{ fontSize: '0.8rem' }}>{tc.machineName || '—'}</span>
-                              <span style={{ color: tc.expectedStatus === 'PASS' ? '#00ff88' : '#ff0055', fontSize: '0.8rem' }}>{tc.expectedStatus}</span>
-                              <span style={{ fontSize: '0.7rem', color: tc.generatedBy === 'llm' ? 'var(--secondary-glow)' : 'var(--text-dim)' }}>{tc.generatedBy}</span>
-                            </div>
-                          ))}
-                        </div>
-                    }
+                  <div className="tc-table">
+                    <div className="tc-row tc-header">
+                      <span>Ref</span><span>Component</span><span>Scenario Description</span><span>Target</span><span>Expect</span><span>Type</span>
+                    </div>
+                    {testCases[s.sessionId]?.map(tc => (
+                      <div key={tc.testId} className="tc-row">
+                        <code style={{ color: 'var(--primary-glow)' }}>{tc.testId}</code>
+                        <span style={{ fontWeight: 600 }}>{tc.service.replace('-service', '')}</span>
+                        <span style={{ color: 'var(--text-dim)', fontSize: '0.8rem' }}>{tc.scenario}</span>
+                        <span style={{ fontSize: '0.8rem' }}>{tc.machineName || 'GLOBAL'}</span>
+                        <span style={{ color: tc.expectedStatus === 'PASS' ? 'var(--accent-green)' : 'var(--accent-pink)', fontWeight: 700 }}>{tc.expectedStatus}</span>
+                        <span style={{ fontSize: '0.65rem', opacity: 0.6 }}>{tc.generatedBy.toUpperCase()}</span>
+                      </div>
+                    ))}
                   </div>
                 )}
 
-                {/* Results */}
                 {detail === 'results' && (
-                  <div style={{ marginTop: '0.75rem' }}>
-                    {!results[s.sessionId]?.length
-                      ? <p style={{ color: 'var(--text-dim)', fontSize: '0.85rem' }}>No results yet.</p>
-                      : <div className="tc-table">
-                          <div className="tc-row tc-header">
-                            <span>Test ID</span><span>Barcode</span><span>Service</span><span>Status</span><span>Reason</span>
-                          </div>
-                          {results[s.sessionId].map((r, i) => (
-                            <div key={i} className="tc-row">
-                              <code style={{ color: 'var(--primary-glow)', fontSize: '0.75rem' }}>{r.testId}</code>
-                              <span style={{ fontFamily: 'monospace', fontSize: '0.75rem' }}>{r.barcode}</span>
-                              <span style={{ fontSize: '0.8rem' }}>{r.service}</span>
-                              <span style={{
-                                color: r.status === 'PASS' ? '#00ff88' : r.status === 'FAIL' ? '#ff0055' : '#ffcc00',
-                                fontWeight: 700, fontSize: '0.8rem'
-                              }}>{r.status}</span>
-                              <span style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>{r.reason || '—'}</span>
-                            </div>
-                          ))}
+                  <div className="tc-table">
+                    <div className="tc-row tc-header">
+                      <span>Test ID</span><span>Trace ID (Barcode)</span><span>Microservice</span><span>Actual</span><span>Logic Reason</span>
+                    </div>
+                    {results[s.sessionId]?.map((r, i) => {
+                       const tc = testCases[s.sessionId]?.find(x => x.testId === r.testId);
+                       const isCorrectOutcome = tc ? r.status === tc.expectedStatus : r.status === 'PASS';
+                       
+                       return (
+                        <div key={i} className="tc-row">
+                          <code>{r.testId}</code>
+                          <span style={{ fontFamily: 'monospace', color: 'var(--primary-glow)', fontSize: '0.8rem' }}>{r.barcode}</span>
+                          <span style={{ fontSize: '0.8rem' }}>{r.service}</span>
+                          <span style={{ 
+                            color: isCorrectOutcome ? 'var(--accent-green)' : 'var(--accent-pink)',
+                            fontWeight: 800
+                          }}>
+                            {r.status} {isCorrectOutcome ? '✓' : '✗'}
+                          </span>
+                          <span style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>{r.reason || 'No specific trace data'}</span>
                         </div>
-                    }
+                       );
+                    })}
                   </div>
                 )}
 
-                {/* AI Analysis */}
                 {detail === 'analysis' && (
-                  <div style={{ marginTop: '0.75rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-                    {!analysis[s.sessionId]
-                      ? <p style={{ color: 'var(--text-dim)', fontSize: '0.85rem' }}>No AI analysis recorded.</p>
-                      : <>
-                          <div>
-                            <div style={{ fontSize: '0.75rem', color: 'var(--primary-glow)', marginBottom: '0.4rem' }}>CODE INSIGHTS</div>
-                            <p style={{ fontSize: '0.85rem', color: 'var(--text-main)', lineHeight: 1.6 }}>{analysis[s.sessionId].codeInsights}</p>
-                          </div>
-                          <div>
-                            <div style={{ fontSize: '0.75rem', color: 'var(--primary-glow)', marginBottom: '0.4rem' }}>DATABASE INSIGHTS</div>
-                            <p style={{ fontSize: '0.85rem', color: 'var(--text-main)', lineHeight: 1.6 }}>{analysis[s.sessionId].dbInsights}</p>
-                          </div>
-                          {analysis[s.sessionId].scalingPlan?.length > 0 && (
-                            <div>
-                              <div style={{ fontSize: '0.75rem', color: 'var(--primary-glow)', marginBottom: '0.4rem' }}>SCALING PLAN</div>
-                              {analysis[s.sessionId].scalingPlan.map((sp: any, i: number) => (
-                                <div key={i} style={{ fontSize: '0.82rem', marginBottom: '4px' }}>
-                                  <span style={{ color: 'var(--secondary-glow)' }}>{sp.service}</span>: {sp.instances}x — {sp.reason}
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                          {analysis[s.sessionId].failureAnalysis?.length ? (
-                            <div>
-                              <div style={{ fontSize: '0.75rem', color: '#ff0055', marginBottom: '0.4rem' }}>FAILURE ANALYSIS</div>
-                              {analysis[s.sessionId].failureAnalysis!.map((fi, i) => (
-                                <div key={i} style={{ fontSize: '0.82rem', color: '#ffcc00', marginBottom: '4px' }}>• {fi}</div>
-                              ))}
-                            </div>
-                          ) : null}
-                        </>
-                    }
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem', padding: '1rem' }}>
+                    {analysis[s.sessionId] ? (
+                      <>
+                        <div className="glass-card" style={{ background: 'rgba(0,242,255,0.02)' }}>
+                           <h5 style={{ color: 'var(--primary-glow)', marginBottom: '0.5rem', fontSize: '0.8rem' }}>CODEBASE ANALYSIS</h5>
+                           <p style={{ fontSize: '0.85rem', lineHeight: 1.6 }}>{analysis[s.sessionId].codeInsights}</p>
+                        </div>
+                        <div className="glass-card" style={{ background: 'rgba(255,204,0,0.02)' }}>
+                           <h5 style={{ color: 'var(--accent-gold)', marginBottom: '0.5rem', fontSize: '0.8rem' }}>DATABASE INTEGRITY</h5>
+                           <p style={{ fontSize: '0.85rem', lineHeight: 1.6 }}>{analysis[s.sessionId].dbInsights}</p>
+                        </div>
+                      </>
+                    ) : <p>No AI analysis available for this session.</p>}
                   </div>
                 )}
               </div>
