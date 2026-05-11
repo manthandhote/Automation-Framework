@@ -42,7 +42,8 @@ export class Orchestrator {
   private inspectraDb: InspectraDB;
   private runningProcesses: Map<string, ChildProcess[]> = new Map();
 
-  private readonly testDbUri = process.env.TEST_DB_URI || 'mongodb://127.0.0.1:27017';
+  private testDbUri = process.env.TEST_DB_URI || 'mongodb://127.0.0.1:27017';
+  public vmIp: string = '';
 
   constructor(private workspacePath: string) {
     // Auto-resolve if path is missing or invalid
@@ -54,6 +55,13 @@ export class Orchestrator {
     this.llama = new LlamaAnalyst();
     this.inspectraDb = InspectraDB.getInstance();
     logger.info(`Workspace: ${this.workspacePath}`, 'ORCHESTRATOR');
+  }
+
+  public setVmIp(ip: string) {
+    this.vmIp = ip;
+    this.testDbUri = `mongodb://${ip}:27017`;
+    process.env.TEST_DB_URI = this.testDbUri; // Export it for DbAnalyzer
+    logger.info(`Updated TEST_DB_URI to ${this.testDbUri}`, 'ORCHESTRATOR');
   }
 
   async buildSharedLibraries(bePath: string, onLog: (msg: string) => void) {
@@ -145,6 +153,7 @@ export class Orchestrator {
     clientName: string;
     machineDescriptions: string;
     beRepo: string;
+    machineIds?: string[];
     beBranch: string;
     feRepo: string;
     feBranch: string;
@@ -168,6 +177,7 @@ export class Orchestrator {
         feBranch: config.feBranch,
         codeDir: config.codeDir || this.workspacePath,
         dbBackupPath: config.dbBackupPath,
+        machineIds: config.machineIds,
         status: 'RUNNING',
         startedAt: new Date()
       });
@@ -228,17 +238,49 @@ export class Orchestrator {
         feCommit
       });
 
-      // ── STEP 3: DB restore + analysis (runs on host, mongo is on host) ──
-      const restoredDbName = `inspectra_csnd_${config.sessionId}`;
+      // ── STEP 3: DB restore + analysis (transferred to VM via SCP) ───────
+      //
+      // restoredDbName = the primary DB the archive was originally created from.
+      // mongorestore uses --archive (no --nsFrom/--nsTo), so it always restores
+      // into the original DB names embedded in the archive (inspectra_csnd,
+      // incoming_data, etc.).  We point DbAnalyzer at inspectra_csnd because
+      // that is where the machines collection lives.
+      //
+      // NOTE: to re-enable session isolation, change this back to:
+      //   const restoredDbName = `inspectra_csnd_${config.sessionId}`;
+      // and uncomment the mergeAllIntoSessionDb() call below.
+      const restoredDbName = 'inspectra_csnd';
       let dbSummary: DbSummary | null = null;
 
       if (config.dbBackupPath && fs.existsSync(config.dbBackupPath)) {
-        onLog(`[DB] Restoring MongoDB backup...`);
+        onLog(`[DB] Restoring MongoDB backup on VM...`);
         onProgress?.('Restoring Database', 30);
+
+        // 1. Push the archive to the VM via SCP
+        const remoteArchivePath = await this.pushArchiveToVm(config.dbBackupPath, onLog);
+
+        // 2. Signal VM to restore into original DB names (dbName ignored by mongorestore)
+        await emitToInfraWithAck('infra:restore-db', {
+          archivePath: remoteArchivePath,
+          dbName: restoredDbName,   // informational only — mongorestore ignores it
+        }, 600000);
+
         const dbAnalyzer = new DbAnalyzer(this.testDbUri, restoredDbName);
-        await dbAnalyzer.restoreBackup(config.dbBackupPath);
+
+        // ── mergeAllIntoSessionDb is bypassed (services use original DBs) ──
+        // await dbAnalyzer.mergeAllIntoSessionDb();
+        // To re-enable session isolation, uncomment the line above.
+        // ──────────────────────────────────────────────────────────────────
+
         await this.inspectraDb.updateSession(config.sessionId, { restoredDbName });
         dbSummary = await dbAnalyzer.analyze();
+
+        // ✅ Filter dbSummary to only the machines the user selected
+        if (config.machineIds && config.machineIds.length > 0) {
+          const targetMachines = dbSummary.machines.filter(m => config.machineIds!.includes(m.id));
+          dbSummary = { ...dbSummary, machines: targetMachines, totalMachines: targetMachines.length };
+          onLog(`[ORCHESTRATOR] Filtered to ${targetMachines.length} target machines.`);
+        }
       }
 
       // ── STEP 4: LLM Analysis (runs on host, using codeSummary from VM) ───
@@ -370,16 +412,24 @@ location /SIM/ {
     if (!session) throw new Error('Session not found');
 
     const testCases = await this.inspectraDb.getTestCases(sessionId);
-    const dbName = session.restoredDbName || `inspectra_csnd_${sessionId}`;
+    const dbName = session.restoredDbName || 'inspectra_csnd';
 
     const dbAnalyzer = new DbAnalyzer(this.testDbUri, dbName);
     const dbSummary = await dbAnalyzer.analyze();
 
-    const selectedMachine = dbSummary.machines.find(m => m.type?.toLowerCase() === 'astro')
-      || dbSummary.machines.find(m => (m as any).machine_key)
+    // ✅ Filter machines based on what was selected during setup
+    const sessionMachineIds = session.machineIds || [];
+    const targetMachines = sessionMachineIds.length > 0
+      ? dbSummary.machines.filter(m => sessionMachineIds.includes(m.id))
+      : dbSummary.machines;
+
+    const filteredSummary = { ...dbSummary, machines: targetMachines, totalMachines: targetMachines.length };
+
+    const selectedMachine = targetMachines.find(m => m.type?.toLowerCase() === 'astro')
+      || targetMachines[0]
       || dbSummary.machines[0];
 
-    await this.executePhase(sessionId, '/data/NIDOWORKZ/CSND', dbName, testCases, onLog, onProgress, dbSummary, selectedMachine?.id);
+    await this.executePhase(sessionId, '/data/NIDOWORKZ/CSND', dbName, testCases, onLog, onProgress, filteredSummary, selectedMachine?.id);
   }
 
   getHealth(): ServiceInfo[] {
@@ -399,7 +449,7 @@ location /SIM/ {
     const session = await this.inspectraDb.getSession(sessionId);
     if (!session) throw new Error('Session not found');
 
-    const dbName = session.restoredDbName || `inspectra_csnd_${sessionId}`;
+    const dbName = session.restoredDbName || 'inspectra_csnd';
 
     onLog(`[E2E] Initializing E2E test runner for session: ${sessionId}`);
     onProgress?.('Starting E2E Tests', 10);
@@ -467,16 +517,27 @@ location /SIM/ {
     try {
       await this.inspectraDb.updateSession(sessionId, { status: 'RUNNING', startedAt: new Date() });
 
-      const dbName = session.restoredDbName || `inspectra_csnd_${sessionId}`;
+      // Always use the original DB name — no session isolation in this mode.
+      // session.restoredDbName is now always 'inspectra_csnd'.
+      const dbName = session.restoredDbName || 'inspectra_csnd';
 
-      // Re-restore DB if backup exists (host-side mongo)
+      // Re-restore DB if backup exists (transferred to VM via SCP)
       if (session.dbBackupPath && fs.existsSync(session.dbBackupPath)) {
-        onLog(`[ORCHESTRATOR] Re-restoring DB backup...`);
-        const dbAnalyzer = new DbAnalyzer(this.testDbUri, dbName);
-        await dbAnalyzer.restoreBackup(session.dbBackupPath);
+        onLog(`[ORCHESTRATOR] Re-restoring DB backup on VM...`);
+        const remoteArchivePath = await this.pushArchiveToVm(session.dbBackupPath, onLog);
+        // dbName is informational only — mongorestore restores into original archive DB names
+        await emitToInfraWithAck('infra:restore-db', { archivePath: remoteArchivePath, dbName: dbName }, 600000);
       }
 
       const dbAnalyzer = new DbAnalyzer(this.testDbUri, dbName);
+
+      // ── mergeAllIntoSessionDb is bypassed (services use original DBs) ──
+      // if (session.dbBackupPath && fs.existsSync(session.dbBackupPath)) {
+      //   await dbAnalyzer.mergeAllIntoSessionDb();
+      // }
+      // To re-enable session isolation, uncomment the block above.
+      // ──────────────────────────────────────────────────────────────────
+
       const dbSummary = await dbAnalyzer.analyze();
 
       // Get code analysis from VM (no local clone needed)
@@ -518,10 +579,11 @@ location /SIM/ {
     const tempDbName = `temp_analysis_${Date.now()}`;
     const dbAnalyzer = new DbAnalyzer(this.testDbUri, tempDbName);
     try {
-      // await this.ensureTestDb(() => { });  ← DELETE this line
-      await dbAnalyzer.restoreBackup(dbBackupPath);
+      const remoteArchivePath = await this.pushArchiveToVm(dbBackupPath, (m) => logger.info(m));
+      await emitToInfraWithAck('infra:restore-db', { archivePath: remoteArchivePath, dbName: tempDbName }, 600000);
+      await dbAnalyzer.mergeAllIntoSessionDb();  // this is a no-op while bypassed — safe to leave
       const summary = await dbAnalyzer.analyze();
-      return { totalMachines: summary.totalMachines, machines: summary.machines.map(m => m.name) };
+      return { totalMachines: summary.totalMachines, machines: summary.machines.map(m => ({ id: m.id, name: m.name })) };
     } catch (err) {
       console.error('DB Discovery failed:', err);
       throw err;
@@ -553,10 +615,11 @@ location /SIM/ {
         dbName,
         machineId: selectedMachine?.id || '',
         machineKey: (selectedMachine as any)?.machine_key || 'MA01',
-      }, 120000);
+      }, 900000); // 15 mins timeout for heavy npm installs
       onLog?.(`[ORCHESTRATOR] VM services are up.`);
     } catch (e: any) {
-      onLog?.(`[WARNING] VM service spawn issue: ${e.message} — proceeding`);
+      onLog?.(`[ERROR] VM service spawn failed: ${e.message} — aborting tests`);
+      throw new Error(`Cannot run tests: VM services failed to spawn (${e.message})`);
     }
 
     onProgress?.('Running Tests', 85);
@@ -580,6 +643,31 @@ location /SIM/ {
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+  private async pushArchiveToVm(localArchivePath: string, onLog: (msg: string) => void): Promise<string> {
+    const remotePath = `/tmp/session_backup.archive`;
+    const sshKey = process.env.VM_SSH_KEY;
+    const sshUser = process.env.VM_SSH_USER ?? 'manthan';
+
+    if (!this.vmIp) {
+      throw new Error('VM IP is not known. Ensure the VM is connected before running.');
+    }
+
+    if (!sshKey) {
+      throw new Error('VM_SSH_KEY environment variable is missing.');
+    }
+
+    onLog(`[SCP] Pushing ${path.basename(localArchivePath)} → ${sshUser}@${this.vmIp}:${remotePath}`);
+
+    // Convert Windows path to something scp can handle if needed, or wrap in quotes
+    await execAsync(
+      `scp -i "${sshKey}" -o StrictHostKeyChecking=no "${localArchivePath}" ${sshUser}@${this.vmIp}:${remotePath}`,
+      { timeout: 120000 }
+    );
+
+    onLog('[SCP] ✅ File transferred.');
+    return remotePath;
+  }
 
   private async ensureTestDb(onLog: (msg: string) => void) {
     const containerName = 'inspectra-test-mongo';

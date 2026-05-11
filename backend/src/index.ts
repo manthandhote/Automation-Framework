@@ -100,14 +100,14 @@ app.post('/api/setup', async (req, res) => {
     feRepo, feBranch,
     codeDir,
     dbBackupPath,
-    testFilePath
+    testFilePath, machineIds
   } = req.body;
 
   const sessionId = `SES-${Date.now()}`;
 
   try {
     const result = await orchestrator.coordinateRun(
-      { sessionId, clientName, machineDescriptions, beRepo, beBranch, feRepo, feBranch, codeDir, dbBackupPath, testFilePath },
+      { sessionId, clientName, machineDescriptions, beRepo, beBranch, feRepo, feBranch, codeDir, dbBackupPath, testFilePath, machineIds },
       (msg) => {
         console.log(msg); // 🖥️ Print to terminal
         io.emit('simulator:packet', { data: msg, timestamp: new Date().toISOString() });
@@ -303,6 +303,68 @@ app.get('/api/sessions/:id/report', async (req, res) => {
   }
 });
 
+// ── Download JSON Report ───────────────────────────────────────────────────────
+app.get('/api/sessions/:id/download/json', async (req, res) => {
+  try {
+    const sessionId = req.params.id;
+    const session = await inspectraDb.getSession(sessionId);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    const analysis = await inspectraDb.getAnalysis(sessionId);
+    const results = await inspectraDb.getResults(sessionId);
+    const tr = new TestRunner(mongoUri, workspacePath);
+    const report = await tr.assembleFinalReport(
+      sessionId, 'infra-node-01',
+      { beCommit: session.beCommit, feCommit: session.feCommit },
+      { os: 'linux', memory: '16GB' }, { avg_latency_ms: 420 },
+      { status: session.status }, [],
+      analysis?.recommendations || [], results as any
+    );
+
+    const safeName = `Report_${sessionId}`.replace(/[^a-zA-Z0-9_\-]/g, '_');
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.json"`);
+    res.send(JSON.stringify(report, null, 2));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Download CSV Report ────────────────────────────────────────────────────────
+app.get('/api/sessions/:id/download/csv', async (req, res) => {
+  try {
+    const sessionId = req.params.id;
+    const session = await inspectraDb.getSession(sessionId);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    const results = await inspectraDb.getResults(sessionId);
+    const testCases = await inspectraDb.getTestCases(sessionId);
+
+    const headers = ['Test ID', 'Service', 'Scenario', 'Barcode', 'Expected', 'Actual Status', 'Reason', 'Executed At'];
+    const rows = results.map(r => {
+      const tc = testCases.find(t => t.testId === r.testId);
+      return [
+        r.testId,
+        r.service,
+        tc?.scenario || '',
+        r.barcode,
+        tc?.expectedStatus || '',
+        r.status,
+        `"${(r.reason || '').replace(/"/g, '""')}"`,
+        new Date(r.executedAt).toLocaleString()
+      ].join(',');
+    });
+
+    const csvContent = [headers.join(','), ...rows].join('\n');
+    const safeName = `Results_${sessionId}`.replace(/[^a-zA-Z0-9_\-]/g, '_');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.csv"`);
+    res.send('\uFEFF' + csvContent); // BOM for Excel compatibility
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  Git Branches
 // ══════════════════════════════════════════════════════════════════════════════
@@ -340,7 +402,9 @@ io.on('connection', (socket) => {
 
   socket.on('infra:register', (vmInfo) => {
     infraSocket = socket; // ← store ONLY the infra-node socket here
-    logger.info(`[INFRA] VM Registered: ${vmInfo.hostname} (${vmInfo.os})`, 'INFRA');
+    const vmIp = socket.handshake.address.replace('::ffff:', '');
+    orchestrator.setVmIp(vmIp);
+    logger.info(`[INFRA] VM Registered: ${vmInfo.hostname} (${vmInfo.os}) from IP ${vmIp}`, 'INFRA');
     io.emit('infra:vm-connected', { hostname: vmInfo.hostname, os: vmInfo.os });
   });
 

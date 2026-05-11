@@ -11,46 +11,107 @@ export class TestCaseBuilder {
     this.llama = new LlamaAnalyst();
   }
 
-  async buildWithLlm(dbSummary: DbSummary, codeSummary: CodeSummary): Promise<GeneratedTestCase[]> {
+  async buildWithLlm(
+    dbSummary: DbSummary,
+    codeSummary: CodeSummary
+  ): Promise<GeneratedTestCase[]> {
     const client = new MongoClient(this.mongoUri);
     const realAwbs: RealAwbContext[] = [];
 
     try {
       await client.connect();
-      const db = client.db(this.dbName);
+
+      // ✅ FIX: Each collection lives in its OWN database
+      const machineDb = client.db('machine_configurations');  // machines collection
+      const incomingDb = client.db('incoming_service');        // incoming_data collection
 
       for (const machine of dbSummary.machines.filter(m => m.status)) {
         const machineKey = (machine as any).machine_key || 'MA01';
-        const machineId = machine.id;
 
-        // ── Step 1: Get regex from machine doc ──
-        const machineDoc = await db.collection('machines').findOne({ _id: machineId as any });
-        const barcodeRegex = machineDoc?.regex_config?.barcode_regex?.common_regex || '.*';
+        // ── Step 1: Get the raw _id string exactly as stored ──────────────────
+        // Use machine_key to find the machine doc (safer than relying on mapped id)
+        const machineDoc = await machineDb
+          .collection('machines')
+          .findOne({ machine_key: machineKey });
 
-        // ── Step 2: Find a real AWB from incoming_data ──
-        // Try machine_id match first, then machine_name, then any
-        let incomingDoc = await db.collection('incoming_data').findOne({ machine_id: machineId });
-        
-        if (!incomingDoc) {
-          incomingDoc = await db.collection('incoming_data').findOne({ machine_name: machine.name });
+        if (!machineDoc) {
+          logger.warn(
+            `[TEST-BUILDER] No machine doc found for key ${machineKey}`,
+            'TEST-BUILDER'
+          );
+          continue;
         }
 
+        // _id is a plain string in your DB e.g. "o1da5720-d2ee-4c8a-be37-43f216acc098"
+        const machineId = machineDoc._id.toString();
+        const barcodeRegex =
+          machineDoc?.regex_config?.barcode_regex?.common_regex || '.*';
+
+        logger.info(
+          `[TEST-BUILDER] machine=${machine.name} key=${machineKey} ` +
+          `id=${machineId} regex=${barcodeRegex}`,
+          'TEST-BUILDER'
+        );
+
+        // ── Step 2: Find a real AWB from incoming_data ────────────────────────
+        // Try machine_id string match first (both are plain strings → direct match)
+        let incomingDoc = await incomingDb
+          .collection('incoming_data')
+          .findOne({ machine_id: machineId });
+
+        logger.info(
+          `[TEST-BUILDER] machine_id lookup (${machineId}): ` +
+          `${incomingDoc ? 'FOUND → ' + incomingDoc.awb : 'NOT FOUND'}`,
+          'TEST-BUILDER'
+        );
+
+        // Fallback: match by machine_name
         if (!incomingDoc) {
-          // Last resort: find ANY AWB that matches the machine's regex
-          const allDocs = await db.collection('incoming_data').find({}).limit(100).toArray();
+          incomingDoc = await incomingDb
+            .collection('incoming_data')
+            .findOne({ machine_name: machineDoc.machine_name });
+
+          logger.info(
+            `[TEST-BUILDER] machine_name lookup (${machineDoc.machine_name}): ` +
+            `${incomingDoc ? 'FOUND → ' + incomingDoc.awb : 'NOT FOUND'}`,
+            'TEST-BUILDER'
+          );
+        }
+
+        // Last resort: scan up to 200 docs and regex-match the awb field
+        if (!incomingDoc) {
+          const allDocs = await incomingDb
+            .collection('incoming_data')
+            .find({})
+            .limit(200)
+            .toArray();
+
           const regex = new RegExp(barcodeRegex);
           incomingDoc = allDocs.find(d => d.awb && regex.test(d.awb)) || null;
+
+          logger.info(
+            `[TEST-BUILDER] regex scan fallback: ` +
+            `${incomingDoc ? 'FOUND → ' + incomingDoc.awb : 'NOT FOUND'}`,
+            'TEST-BUILDER'
+          );
         }
 
         const validAwb = incomingDoc?.awb || null;
 
         if (!validAwb) {
-          logger.warn(`[TEST-BUILDER] No valid AWB found for machine ${machine.name}`, 'TEST-BUILDER');
+          logger.warn(
+            `[TEST-BUILDER] ❌ No valid AWB found for machine ${machine.name} — ` +
+            `NORMAL_FLOW and DUPLICATE_SCAN tests will be skipped`,
+            'TEST-BUILDER'
+          );
         } else {
-          logger.info(`[TEST-BUILDER] Found real AWB: ${validAwb} for machine ${machine.name}`, 'TEST-BUILDER');
+          logger.info(
+            `[TEST-BUILDER] ✅ validAwb=${validAwb} for machine ${machine.name}`,
+            'TEST-BUILDER'
+          );
         }
 
-        // ── Step 3: Generate a fake AWB that matches regex but won't be in DB ──
+        // ── Step 3: Generate fake AWB ─────────────────────────────────────────
         const fakeAwb = this.generateFakeAwb(barcodeRegex);
 
         realAwbs.push({
@@ -59,7 +120,7 @@ export class TestCaseBuilder {
           machineKey,
           barcodeRegex,
           validAwb,
-          fakeAwb
+          fakeAwb,
         });
       }
 
@@ -67,25 +128,18 @@ export class TestCaseBuilder {
       await client.close();
     }
 
-    // ── Step 4: Pass real AWB context to LLM ──
-    logger.info(`[TEST-BUILDER] Passing ${realAwbs.length} machine contexts to LLM`, 'TEST-BUILDER');
+    logger.info(
+      `[TEST-BUILDER] Passing ${realAwbs.length} machine contexts to LLM`,
+      'TEST-BUILDER'
+    );
     return await this.llama.generateTestCases(codeSummary, dbSummary, realAwbs);
   }
 
-  /**
-   * Generate a barcode that matches the regex but is guaranteed not in DB.
-   * Uses timestamp to ensure uniqueness.
-   */
   private generateFakeAwb(regexStr: string): string {
-    // Extract prefix from regex like (?:VAL|VL|VLR)
     const prefixMatch = regexStr.match(/\(\?:([A-Z|]+)\)/);
     const prefix = prefixMatch ? prefixMatch[1].split('|')[0] : 'VL';
-
-    // Use timestamp to guarantee it won't exist in DB
     const unique = Date.now().toString().slice(-10);
     const candidate = `${prefix}${unique}`;
-
-    // Ensure length is within 12-16 chars
     return candidate.slice(0, 15).padEnd(12, '0');
   }
 }

@@ -79,7 +79,7 @@ export function SetupChat() {
 
   const [setup, setSetup] = useState<SetupState>({
     clientName: '', machineDescriptions: '', beRepo: '', beBranch: 'main',
-    feRepo: '', feBranch: 'main', codeDir: 'C:\\Users\\Admin\\Desktop\\Automation-Framework\\runs',
+    feRepo: '', feBranch: 'main', codeDir: '/data/NIDOWORKZ/',
     dbBackupPath: ''
   });
 
@@ -150,7 +150,7 @@ export function SetupChat() {
     }, delay);
   };
 
-  const handleMachineConfirm = async (description: string) => {
+  const handleMachineConfirm = async (description: string, machineIds: string[]) => {
     addUserMessage(`Selected: **${description}**`);
     const updatedSetup = { ...setup, machineDescriptions: description, dbBackupPath: dbBackupPathRef.current };
     setSetup(updatedSetup);
@@ -160,7 +160,7 @@ export function SetupChat() {
     simulateTypingThenSay('⚙️ **Provisioning environment and generating test cases...** Please wait.');
 
     try {
-      const res = await axios.post(`${API_BASE}/api/setup`, updatedSetup);
+      const res = await axios.post(`${API_BASE}/api/setup`, { ...updatedSetup, machineIds });
       const sid = res.data.sessionId;
       setSessionId(sid);
       setProgress(null); // Clear progress bar after setup response
@@ -195,10 +195,10 @@ export function SetupChat() {
     setStep('RUNNING');
     setIsRunning(true);
     simulateTypingThenSay('🚀 **Test cases approved!** Starting automation run...');
-    
+
     try {
       await axios.post(`${API_BASE}/api/sessions/${sid}/start-tests`);
-      
+
       // Start polling for completion since the backend is async
       const poll = setInterval(async () => {
         try {
@@ -339,7 +339,7 @@ export function SetupChat() {
     try {
       const res = await axios.post(`${API_BASE}/api/upload`, formData);
       const dbPath = res.data.paths.dbFile;
-      dbBackupPathRef.current = dbPath; 
+      dbBackupPathRef.current = dbPath;
       setSetup(s => ({ ...s, dbBackupPath: dbPath }));
       setIsUploading(false);
 
@@ -533,24 +533,39 @@ function TestCaseReviewer({ sessionId, cases, onConfirm }: { sessionId: string, 
   );
 }
 
-function DiscoveredMachinesPicker({ machines, onConfirm }: { machines: string[], onConfirm: (desc: string) => void }) {
-  const [selected, setSelected] = useState<string[]>([]);
+function DiscoveredMachinesPicker({ machines, onConfirm }: {
+  machines: { id: string, name: string }[],
+  onConfirm: (desc: string, machineIds: string[]) => void
+}) {
+  const [selected, setSelected] = useState<{ id: string, name: string }[]>([]);
 
-  const toggle = (m: string) => {
-    setSelected(prev => prev.includes(m) ? prev.filter(x => x !== m) : [...prev, m]);
+  const toggle = (m: { id: string, name: string }) => {
+    setSelected(prev =>
+      prev.find(x => x.id === m.id)
+        ? prev.filter(x => x.id !== m.id)
+        : [...prev, m]
+    );
   };
 
   return (
     <div className="machine-selector">
       <div className="machine-grid">
         {machines.map(m => (
-          <div key={m} className={`machine-item ${selected.includes(m) ? 'active' : ''}`} onClick={() => toggle(m)}>
-            <span className="machine-name">{m}</span>
+          <div
+            key={m.id}
+            className={`machine-item ${selected.find(x => x.id === m.id) ? 'active' : ''}`}
+            onClick={() => toggle(m)}
+          >
+            <span className="machine-name">{m.name}</span>
           </div>
         ))}
       </div>
-      <button className="confirm-btn" disabled={selected.length === 0} onClick={() => onConfirm(selected.join(', '))}>
-        Target Selected Machines
+      <button
+        className="confirm-btn"
+        disabled={selected.length === 0}
+        onClick={() => onConfirm(selected.map(m => m.name).join(', '), selected.map(m => m.id))}
+      >
+        Target Selected Machines ({selected.length})
       </button>
     </div>
   );

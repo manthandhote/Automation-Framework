@@ -1,5 +1,6 @@
 import path from 'path';
 import fs from 'fs';
+import * as net from 'net';
 import { simulateOnInfra } from './index';
 import { BackendValidator, ValidationResult } from './validator';
 import { UIValidator } from './ui-validator';
@@ -9,11 +10,34 @@ import { DbSummary } from './db-analyzer';
 
 export interface SimulationResult {
   trackingId: string;
-  protocol: string;
+  barcode: string;
+  machineKey: string;
+  steps: Array<{
+    type: 'PB' | 'PD' | 'PC';
+    packet: string;
+    response: string;
+    accepted: boolean;
+  }>;
+  finalStatus: 'SORTED' | 'REJECTED_PB' | 'REJECTED_PD' | 'ERROR' | 'INCOMPLETE';
+  sortLocation?: string;
+  rejectionCode?: string;
+  durationMs: number;
+}
+
+function extractResponses(sim: SimulationResult): {
   pbResponse: string;
   pdResponse: string;
   pcResponse: string;
-  lastResponse: string;
+} {
+  const pb = sim.steps.find(s => s.type === 'PB');
+  const pd = sim.steps.find(s => s.type === 'PD');
+  const pc = sim.steps.find(s => s.type === 'PC');
+
+  return {
+    pbResponse: pb?.response ?? '',
+    pdResponse: pd?.response ?? '',
+    pcResponse: pc?.response ?? '',
+  };
 }
 
 export interface TestCase {
@@ -24,6 +48,7 @@ export interface TestCase {
   expectedStatus: 'PASS' | 'FAIL';
   barcode?: string;
   machineName?: string;
+  machineId?: string;
   configName?: string;
   endpoint?: string;
   method?: string;
@@ -32,7 +57,7 @@ export interface TestCase {
   protocol?: any;
   expectedSortCode?: string;
   weight?: number;
-  dims?: { l: number, b: number, h: number };
+  dims?: { l: number; w: number; h: number };
 }
 
 export interface TestResult {
@@ -44,12 +69,10 @@ export interface TestResult {
   actualStatus: 'PASS' | 'FAIL' | 'ERROR';
   passed: boolean;
 
-  // Phase results
   simulation: SimulationResult | null;
   validation: ValidationResult | null;
   uiResult: any | null;
 
-  // Meta
   durationMs: number;
   error?: string;
   reason?: string;
@@ -68,27 +91,133 @@ export class TestRunner {
     this.inspectraDb = InspectraDB.getInstance();
   }
 
-  // ─── Run all test cases for a session ─────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────
+  // Resolve VM Host
+  // ─────────────────────────────────────────────────────────────
+  private resolveVmHost(): string {
+    const orchestratorUrl = process.env.ORCHESTRATOR_URL || '';
+    const match = orchestratorUrl.match(/https?:\/\/([\d.]+)/);
+
+    if (match?.[1]) {
+      return match[1];
+    }
+
+    return process.env.VM_HOST || '127.0.0.1';
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Wait for TCP Port
+  // ─────────────────────────────────────────────────────────────
+  private async waitForPort(
+    host: string,
+    port: number,
+    timeoutMs: number = 60000,
+    intervalMs: number = 1000,
+    label: string = `${host}:${port}`,
+    onLog?: (msg: string) => void
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let attempt = 0;
+
+    while (Date.now() < deadline) {
+      attempt++;
+
+      const ready = await new Promise<boolean>((resolve) => {
+        const sock = new net.Socket();
+
+        const timer = setTimeout(() => {
+          sock.destroy();
+          resolve(false);
+        }, 1000);
+
+        sock.connect(port, host, () => {
+          clearTimeout(timer);
+          sock.destroy();
+          resolve(true);
+        });
+
+        sock.on('error', () => {
+          clearTimeout(timer);
+          resolve(false);
+        });
+      });
+
+      if (ready) {
+        onLog?.(`  [READY] ${label} is up (attempt ${attempt})`);
+        return;
+      }
+
+      if (attempt % 5 === 0) {
+        onLog?.(
+          `  [WAIT] ${label} not ready yet... (${Math.round(
+            (deadline - Date.now()) / 1000
+          )}s left)`
+        );
+      }
+
+      await this.sleep(intervalMs);
+    }
+
+    throw new Error(`Timeout waiting for ${label}`);
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Wait For All Services
+  // ─────────────────────────────────────────────────────────────
+  private async waitForAllServices(onLog?: (msg: string) => void): Promise<void> {
+    onLog?.('  [STARTUP] Waiting for all services to be ready...');
+    const vmHost = this.resolveVmHost();
+
+    // Wait for app-device-interface HTTP port (5500), not TCP device port (3000)
+    await this.waitForPort(vmHost, 5500, 60000, 1000,
+      `app-device-interface ${vmHost}:5500`, onLog);
+
+    // Wait for validation-engine
+    await this.waitForPort(vmHost, 5000, 60000, 1000,
+      `validation-engine ${vmHost}:5000`, onLog);
+
+    onLog?.('  [STARTUP] Ports open — waiting 3s...');
+    await this.sleep(3000);
+    onLog?.('  [STARTUP] ✅ All services ready.');
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Run All Tests
+  // ─────────────────────────────────────────────────────────────
   async runAll(
     sessionId: string,
     testCases: TestCase[],
     dbSummary: DbSummary,
     onLog?: (msg: string) => void
   ): Promise<TestResult[]> {
+
     const sessionDbName = `inspectra_csnd_${sessionId}`;
-    const runsDir = path.join(this.workspacePath, 'runs', `run_${sessionId}`);
+
+    const runsDir = path.join(
+      this.workspacePath,
+      'runs',
+      `run_${sessionId}`
+    );
+
     const screenshotsDir = path.join(runsDir, 'screenshots');
 
     if (!fs.existsSync(screenshotsDir)) {
       fs.mkdirSync(screenshotsDir, { recursive: true });
     }
 
-    onLog?.(`[TEST-RUNNER] Starting ${testCases.length} test cases for session ${sessionId}`);
+    onLog?.(
+      `[TEST-RUNNER] Starting ${testCases.length} test cases`
+    );
+
+    await this.waitForAllServices(onLog);
 
     const results: TestResult[] = [];
 
     for (const tc of testCases) {
-      onLog?.(`[TEST-RUNNER] ▶ Running ${tc.testId}: ${tc.description}`);
+
+      onLog?.(
+        `[TEST-RUNNER] ▶ Running ${tc.testId}: ${tc.description}`
+      );
 
       const result = await this.runSingle(
         tc,
@@ -101,38 +230,40 @@ export class TestRunner {
 
       results.push(result);
 
-      // Save result to DB
       await this.inspectraDb.saveResult({
         sessionId,
         testId: tc.testId,
         barcode: result.barcode,
         service: tc.service,
         status: result.actualStatus,
-        reason: result.reason || result.error || (result.passed ? 'Passed' : 'Failed'),
-        trace: result.validation ? {
-          ingestion: result.validation.layer1_ingestion.found,
-          sorting: result.validation.layer2_sorting.found,
-          integration: result.validation.layer3_integration.found
-        } : null,
-        executedAt: new Date()
+        reason:
+          result.reason ||
+          result.error ||
+          (result.passed ? 'Passed' : 'Failed'),
+        trace: result.validation
+          ? {
+            ingestion: result.validation.layer1_ingestion.found,
+            sorting: result.validation.layer2_sorting.found,
+            integration: result.validation.layer3_integration.found,
+          }
+          : null,
+        executedAt: new Date(),
       });
 
       onLog?.(
-        `[TEST-RUNNER] ${result.passed ? '✅' : '❌'} ${tc.testId} → ${result.actualStatus} (${result.durationMs}ms)`
+        `[TEST-RUNNER] ${result.passed ? '✅' : '❌'
+        } ${tc.testId} → ${result.actualStatus}`
       );
 
-      // Small gap between test cases
-      await this.sleep(500);
+      await this.sleep(800);
     }
-
-    const passed = results.filter(r => r.passed).length;
-    const failed = results.filter(r => !r.passed).length;
-    onLog?.(`[TEST-RUNNER] ✅ Complete: ${passed} passed, ${failed} failed out of ${results.length}`);
 
     return results;
   }
 
-  // ─── Run a single test case through all 3 phases ──────────────────────────
+  // ─────────────────────────────────────────────────────────────
+  // Run Single Test
+  // ─────────────────────────────────────────────────────────────
   private async runSingle(
     tc: TestCase,
     sessionId: string,
@@ -141,77 +272,91 @@ export class TestRunner {
     screenshotsDir: string,
     onLog?: (msg: string) => void
   ): Promise<TestResult> {
-    const startTime = Date.now();
-    const barcode = tc.barcode || this.generateBarcode();
-    const machineId = (tc as any).machineId;
-    
-    const machineName = tc.machineName || dbSummary.machines[0]?.name || 'Unknown';
 
-    // Find machine config for TCP port
-    const machine = dbSummary.machines.find(m =>
-      m.id === machineId ||
-      (m as any).machine_key === machineName
-    ) || dbSummary.machines[0];
-    const tcpPort = 3000; // app-device-interface TCP server port from machine config
+    const startTime = Date.now();
+    const tcpPort = 3000;      // ✅ correct — this is the PLC barcode TCP server
+    const vmHost = this.resolveVmHost();
+    const barcode =
+      tc.barcode || this.generateBarcode();
+
+    const machine =
+      dbSummary.machines.find(
+        (m) =>
+          m.id === tc.machineId ||
+          (m as any).machine_key === tc.machineName
+      ) || dbSummary.machines[0];
+
+    const machineName = machine?.name || 'Unknown';
+
+    const machineKey =
+      tc.machineName ||
+      (machine as any)?.machine_key ||
+      'MA01';
 
     let simulation: SimulationResult | null = null;
     let validation: ValidationResult | null = null;
     let uiResult: any | null = null;
-    let screenshotPath: string | undefined;
 
     try {
-      // ── PHASE 1: Hardware Simulation ───────────────────────────────────────
-      onLog?.(`  [PHASE 1] Injecting ${barcode} into TCP port ${tcpPort}...`);
 
-      const protocol = machine?.type?.includes('astro') ? 'astro' : 'capella';
+      onLog?.(
+        `  [TCP] Connecting to ${vmHost}:${tcpPort}`
+      );
 
-      const machineKey = (tc as any).machineName  
-        || (machine as any)?.machine_key        
-        || 'MA01'; 
+      const dims =
+        tc.dims ?? { l: 187, w: 172, h: 47 };
+
+      const weight = tc.weight ?? 0.12;
+
+      // DUPLICATE TEST
       if (tc.isDuplicate) {
-        // For duplicate test: run cycle twice, second run should return SBRR
-        await simulateOnInfra({ barcode: tc.barcode, machineKey, protocol: tc.protocol || 'capella', transport: 'tcp', options: { host: '127.0.0.1', port: 3000 } });
-        await new Promise(r => setTimeout(r, 1000));
 
-        const secondResult = await simulateOnInfra({ barcode: tc.barcode, machineKey, protocol: tc.protocol || 'capella', transport: 'tcp', options: { host: '127.0.0.1', port: 3000 } });
+        await simulateOnInfra({
+          barcode: tc.barcode,
+          machineKey,
+          dims,
+          weight,
+          edgeProfile: 'NORMAL',
+          options: {
+            host: vmHost,
+            port: tcpPort,
+          },
+        });
 
-        const allSecondResponses = [
-          secondResult.pbResponse,
-          secondResult.pdResponse,
-          secondResult.pcResponse
-        ].filter(Boolean).join(' ');
+        await this.sleep(1000);
 
-        const gotSbrr = allSecondResponses.includes('SBRR');
+        const secondRaw = await simulateOnInfra({
+          barcode: tc.barcode,
+          machineKey,
+          dims,
+          weight,
+          edgeProfile: 'NORMAL',
+          options: {
+            host: vmHost,
+            port: tcpPort,
+          },
+        });
 
-        return {
-          testId: tc.testId,
-          scenario: tc.scenario,
-          barcode,
-          machineName,
-          expectedStatus: tc.expectedStatus,
-          actualStatus: gotSbrr ? 'PASS' : 'FAIL',
-          passed: gotSbrr,
-          simulation: secondResult,
-          validation: null,
-          uiResult: null,
-          durationMs: Date.now() - startTime
-        };
-      }
-      const dims = (tc as any).dims || { l: 187, b: 172, h: 47 };
-      const weight = (tc as any).weight || 0.12;
-      simulation = await simulateOnInfra({ barcode, machineKey, protocol, dims, weight, transport: 'tcp', options: { host: '127.0.0.1', port: tcpPort } });
-      if (tc.expectedSortCode) {
-        // DNFR/IBAR/CFGR/SBRR are in pbResponse (barcode validation response)
-        // SUCC is also in pbResponse for successful sorts
+        const second =
+          secondRaw as unknown as SimulationResult;
+
+        const {
+          pbResponse,
+          pdResponse,
+          pcResponse,
+        } = extractResponses(second);
+
         const allResponses = [
-          simulation?.pbResponse,
-          simulation?.pdResponse,
-          simulation?.pcResponse
-        ].filter(Boolean).join(' ');
+          pbResponse,
+          pdResponse,
+          pcResponse,
+        ]
+          .filter(Boolean)
+          .join(' ');
 
-        onLog?.(`  [PHASE 1] Responses — PB:${simulation?.pbResponse} PD:${simulation?.pdResponse} PC:${simulation?.pcResponse}`);
-
-        const passed = allResponses.includes(tc.expectedSortCode);
+        const gotDupr =
+          allResponses.includes('DUPR') ||
+          second.rejectionCode === 'DUPR';
 
         return {
           testId: tc.testId,
@@ -219,49 +364,90 @@ export class TestRunner {
           barcode,
           machineName,
           expectedStatus: tc.expectedStatus,
-          actualStatus: passed ? 'PASS' : 'FAIL',
-          passed,
-          simulation,
+          actualStatus: gotDupr ? 'PASS' : 'FAIL',
+          passed: gotDupr,
+          simulation: second,
           validation: null,
           uiResult: null,
           durationMs: Date.now() - startTime,
-          reason: passed
-            ? `Got expected ${tc.expectedSortCode}`
-            : `Expected ${tc.expectedSortCode}, got: ${allResponses}`
+          reason: gotDupr
+            ? 'Got expected DUPR'
+            : `Expected DUPR, got: ${allResponses}`,
         };
       }
-      onLog?.(`  [PHASE 1] ✅ Simulation done — tracking: ${(simulation as any).trackingId}`);
 
-      // Wait for services to process
+      // NORMAL TEST
+      const simRaw = await simulateOnInfra({
+        barcode,
+        machineKey,
+        dims,
+        weight,
+        edgeProfile: 'NORMAL',
+        options: {
+          host: vmHost,
+          port: tcpPort,
+        },
+      });
+
+      simulation =
+        simRaw as unknown as SimulationResult;
+
+      const {
+        pbResponse,
+        pdResponse,
+        pcResponse,
+      } = extractResponses(simulation);
+
+      onLog?.(
+        `  [PHASE 1] PB:${pbResponse} PD:${pdResponse} PC:${pcResponse}`
+      );
+
       await this.sleep(6000);
 
-      // ── PHASE 2: Backend Validation ────────────────────────────────────────
-      onLog?.(`  [PHASE 2] Validating barcode in DB layers...`);
+      // BACKEND VALIDATION
+      const validator = new BackendValidator(this.mongoUri, 'sorting_service');
 
-      const validator = new BackendValidator(this.mongoUri, sessionDbName);
-      validation = await validator.validateParcel(barcode, 10, 2000);
+      validation = await validator.validateParcel(
+        barcode,
+        10,
+        2000
+      );
 
-      onLog?.(`  [PHASE 2] L1:${validation.layer1_ingestion.found} L2:${validation.layer2_sorting.found} L3:${validation.layer3_integration.found}`);
-
-      // ── PHASE 3: Frontend Validation ──────────────────────────────────────
-      onLog?.(`  [PHASE 3] Validating UI display using DOM assertions...`);
-
+      // UI VALIDATION
       try {
-        const commitId = (tc as any).commitId || 'latest';
-        const apiResponse = { status: validation?.overallPass ? 'PASS' : 'FAIL' };
-        uiResult = await this.uiValidator.validateParcelDisplay(
-            'http://localhost:7001/FE-CSND/CL0003/master_search.php', barcode, sessionId, commitId, apiResponse
-        );
-        onLog?.(`  [PHASE 3] UI: ${uiResult?.status} | ${uiResult?.reason}`);
+
+        const commitId =
+          (tc as any).commitId || 'latest';
+
+        const apiResponse = {
+          status: validation?.overallPass
+            ? 'PASS'
+            : 'FAIL',
+        };
+
+        uiResult =
+          await this.uiValidator.validateParcelDisplay(
+            `http://${process.env.VM_HOST}:7001/CL0003/master_search.php`,
+            barcode,
+            sessionId,
+            commitId,
+            apiResponse
+          );
+
       } catch (uiErr: any) {
-        onLog?.(`  [PHASE 3] ⚠️ UI check skipped: ${uiErr.message}`);
-        uiResult = { found: false, error: uiErr.message, status: 'ERROR' };
+
+        uiResult = {
+          found: false,
+          error: uiErr.message,
+          status: 'ERROR',
+        };
       }
 
-      // ── Determine Pass/Fail ────────────────────────────────────────────────
-      const backendPassed = validation.overallPass;
-      const actualStatus: 'PASS' | 'FAIL' = backendPassed ? 'PASS' : 'FAIL';
-      const passed = actualStatus === tc.expectedStatus;
+      const backendPassed =
+        validation.overallPass;
+
+      const actualStatus: 'PASS' | 'FAIL' =
+        backendPassed ? 'PASS' : 'FAIL';
 
       return {
         testId: tc.testId,
@@ -270,16 +456,21 @@ export class TestRunner {
         machineName,
         expectedStatus: tc.expectedStatus,
         actualStatus,
-        passed,
+        passed:
+          actualStatus === tc.expectedStatus,
         simulation,
         validation,
         uiResult,
         durationMs: Date.now() - startTime,
-        screenshotPath
       };
 
     } catch (err: any) {
-      logger.error(`[TEST-RUNNER] ${tc.testId} crashed: ${err.message}`, 'TEST-RUNNER');
+
+      logger.error(
+        `[TEST-RUNNER] ${tc.testId} crashed: ${err.message}`,
+        'TEST-RUNNER'
+      );
+
       return {
         testId: tc.testId,
         scenario: tc.scenario,
@@ -292,60 +483,70 @@ export class TestRunner {
         validation,
         uiResult,
         durationMs: Date.now() - startTime,
-        error: err.message
+        error: err.message,
       };
     }
   }
 
   private generateBarcode(): string {
     const prefixes = ['VL', 'VAL'];
-    const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
-    const num = Math.floor(Math.random() * 9999999999999).toString().padStart(13, '0');
+
+    const prefix =
+      prefixes[Math.floor(Math.random() * prefixes.length)];
+
+    const num = Math.floor(
+      Math.random() * 9999999999999
+    )
+      .toString()
+      .padStart(13, '0');
+
     return `${prefix}${num}`.slice(0, 16);
   }
 
   async assembleFinalReport(
     sessionId: string,
-    vmId: string,
-    gitData: any,
-    infraData: any,
-    performanceData: any,
-    comparisonData: any,
-    alertsData: any[],
-    rootCauses: string[],
-    testResults: TestResult[]
-  ) {
+    machineId: string,
+    commits: { beCommit?: string; feCommit?: string },
+    env: any,
+    perf: any,
+    sessionStatus: any,
+    alerts: any[],
+    recommendations: string[],
+    testResults: any[]
+  ): Promise<any> {
     const total = testResults.length;
-    const pass = testResults.filter(r => r.actualStatus === 'PASS' || r.uiResult?.status === 'PASS').length;
-    const healed = testResults.filter(r => r.uiResult?.status === 'HEALED').length;
-    const fail = total - pass - healed;
+    const pass = testResults.filter(r => r.status === 'PASS').length;
+    const fail = testResults.filter(r => r.status === 'FAIL' || r.status === 'ERROR').length;
+    const healed = testResults.filter(r => r.status === 'HEALED').length;
 
-    const report = {
+    const steps = testResults.map(r => ({
+      step_id: r.testId || r.barcode,
+      action: r.service || 'UI Validation',
+      expected: 'PASS',
+      actual: r.status,
+      latency_ms: r.durationMs || 0,
+      reason: r.reason || 'Verification complete'
+    }));
+
+    return {
       test_run_id: sessionId,
-      vm_id: vmId,
-      git: gitData,
-      infra: infraData,
       execution: {
-        steps: testResults.map(r => ({
-          step_id: r.testId,
-          action: r.scenario || 'validation',
-          expected: r.expectedStatus,
-          actual: r.uiResult?.status || r.actualStatus,
-          status: r.uiResult?.status || r.actualStatus,
-          reason: r.uiResult?.reason || r.error || 'Passed'
-        })),
-        summary: { total, pass, fail, healed }
+        summary: { total, pass, fail, healed },
+        steps
       },
-      performance: performanceData,
-      comparison: comparisonData,
-      alerts: alertsData,
-      root_causes: rootCauses
+      infra: {
+        machine_id: machineId,
+        os: env.os,
+        memory: env.memory,
+        commits
+      },
+      performance: perf,
+      root_causes: recommendations.length > 0 ? recommendations : (fail > 0 ? ['Infrastructure instability detected', 'Potential DB mismatch'] : []),
+      session_status: sessionStatus
     };
-
-    return report;
   }
 
   private sleep(ms: number) {
-    return new Promise(r => setTimeout(r, ms));
+    return new Promise((r) => setTimeout(r, ms));
   }
 }

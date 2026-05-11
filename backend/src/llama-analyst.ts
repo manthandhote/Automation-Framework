@@ -44,7 +44,7 @@ export class LlamaAnalyst {
 
   // ─── Core request helper ─────────────────────────────────────────────────────
   private async ask(prompt: string, expectJson: boolean = true, retries: number = 3): Promise<string> {
-    const timeout = Number(process.env.LLM_TIMEOUT_MS) || 300000;
+    const timeout = Number(process.env.LLM_TIMEOUT_MS) || 5000;
 
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {

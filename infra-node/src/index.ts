@@ -33,12 +33,14 @@ socket.on('connect', async () => {
   const nginxStatus = await Installer.checkAndInstallNginx();
   const phpStatus = await Installer.checkAndInstallPhp();
   const gitStatus = await Installer.checkAndInstallGit();
+  const mongoStatus = await Installer.checkAndInstallMongo();
 
   socket.emit('infra:status', {
     nginx: nginxStatus ? 'running' : 'not running',
     php: phpStatus ? 'installed' : 'not installed',
     git: gitStatus ? 'installed' : 'not installed',
-    status: (nginxStatus && phpStatus && gitStatus) ? 'PASS' : 'FAIL'
+    mongo: mongoStatus ? 'installed' : 'not installed',
+    status: (nginxStatus && phpStatus && gitStatus && mongoStatus) ? 'PASS' : 'FAIL'
   });
 });
 
@@ -159,9 +161,9 @@ socket.on('infra:get-commit-info', async (data: { repoPath: string }, callback: 
     const { exec: execCb } = require('child_process');
     const util = require('util');
     const execP = util.promisify(execCb);
-    
+
     // Add safe.directory exception since repos might be owned by root
-    await execP(`git config --global --add safe.directory ${repoPath}`, { timeout: 10000 }).catch(() => {});
+    await execP(`git config --global --add safe.directory ${repoPath}`, { timeout: 10000 }).catch(() => { });
 
     const { stdout } = await execP(
       `git -C ${repoPath} log -1 --format='{"commit_id":"%H","author":"%an","message":"%s","timestamp":"%ai"}'`,
@@ -175,6 +177,32 @@ socket.on('infra:get-commit-info', async (data: { repoPath: string }, callback: 
   }
 });
 
+// ── Restore DB on VM ────────────────────────────────────────────────────────
+socket.on('infra:restore-db', async (payload: { archivePath: string; dbName: string }, callback: Function) => {
+  const { archivePath, dbName } = payload;
+  logger.info(`[restore-db] Restoring ${archivePath} → ${dbName}...`);
+
+  try {
+    const { exec: execCb } = require('child_process');
+    const util = require('util');
+    const execP = util.promisify(execCb);
+
+    const { stdout, stderr } = await execP(
+      `mongorestore --uri="mongodb://127.0.0.1:27017" \
+       --archive="${archivePath}" --drop`,
+      { timeout: 300000 }
+    );
+    if (stderr && !stderr.includes('done')) {
+      logger.warn(`[restore-db] stderr: ${stderr.split('\n')[0]}`);
+    }
+    logger.info('[restore-db] ✅ Restore complete.');
+    if (callback) callback({ success: true });
+  } catch (err: any) {
+    logger.error(`[restore-db] Failed: ${err.message?.split('\n')[0]}`);
+    if (callback) callback({ success: false, error: err.message });
+  }
+});
+
 socket.on('disconnect', () => {
   logger.info('Disconnected from Orchestrator.');
-});
+});

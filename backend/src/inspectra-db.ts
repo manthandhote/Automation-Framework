@@ -17,6 +17,7 @@ export interface Session {
   codeDir: string;
   dbBackupPath?: string;
   restoredDbName?: string;
+  machineIds?: string[];
   beCommit?: string;
   feCommit?: string;
   status: 'RUNNING' | 'COMPLETED' | 'FAILED';
@@ -35,6 +36,7 @@ export interface GeneratedTestCase {
   payload?: any;
   barcode?: string;
   machineName?: string;
+  machineId?: string;
   configName?: string;
   generatedBy: 'llm' | 'heuristic';
   createdAt: Date;

@@ -113,6 +113,57 @@ export class Installer {
     return false;
   }
 
+  static async checkAndInstallMongo(): Promise<boolean> {
+    if (await Installer.isBinaryAvailable('mongod --version')) {
+      logger.info('MongoDB is already installed.');
+      return true;
+    }
+    logger.info('MongoDB not found. Installing...');
+    if (!await Installer.verifySudo()) return false;
+    await Installer.prepareApt();
+
+    const suite = Installer.ubuntuSuite;
+    const mongoVersion = suite === 'noble' ? '8.0' : '6.0';
+    const distro = suite === 'noble' ? 'noble' : (suite === 'jammy' ? 'jammy' : 'focal');
+
+    try {
+      // Import GPG key
+      await execAsync(
+        `curl -fsSL https://www.mongodb.org/static/pgp/server-${mongoVersion}.asc | \
+         ${SUDO} gpg --dearmor -o /usr/share/keyrings/mongodb-server-${mongoVersion}.gpg`,
+        { env: NO_PROXY_ENV, timeout: 30000 }
+      );
+
+      // Add apt source
+      const source = `deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-${mongoVersion}.gpg ] https://repo.mongodb.org/apt/ubuntu ${distro}/mongodb-org/${mongoVersion} multiverse`;
+      await execAsync(
+        `echo "${source}" | ${SUDO} tee /etc/apt/sources.list.d/mongodb-org-${mongoVersion}.list`,
+        { env: NO_PROXY_ENV }
+      );
+
+      // Update and install
+      await execAsync(`${SUDO} ${APT} update -qq`, { env: NO_PROXY_ENV, timeout: 90000 });
+      await Installer.aptInstall('mongodb-org');
+
+      // Patch bindIp to allow remote connections from Host
+      await execAsync(
+        `${SUDO} sed -i 's/bindIp: 127.0.0.1/bindIp: 0.0.0.0/' /etc/mongod.conf`,
+        { env: NO_PROXY_ENV }
+      );
+
+      // Enable and start
+      await Installer.safeExec(`${SUDO} systemctl enable mongod`);
+      await Installer.safeExec(`${SUDO} systemctl start mongod`);
+
+      logger.info('MongoDB installed and started.');
+      return true;
+    } catch (err: any) {
+      logger.error(`MongoDB install failed: ${err.message?.split('\n')[0]}`);
+      logger.error('Run manually: sudo apt-get install -y mongodb-org');
+      return false;
+    }
+  }
+
   // ─── SUDO VERIFICATION ────────────────────────────────────────────────────
 
   private static async verifySudo(): Promise<boolean> {
