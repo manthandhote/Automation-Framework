@@ -8,14 +8,14 @@ import cors from 'cors';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
-import { AdvancedSimulator } from './platform/advanced-simulator';
-import { LifecycleValidator } from './platform/lifecycle-validator';
-import { PipelineSimulator, PipelineStage } from './pipeline-simulator';
+import { AdvancedSimulator } from './backend-tests/platform/advanced-simulator';
+import { LifecycleValidator } from './backend-tests/platform/lifecycle-validator';
+import { PipelineSimulator, PipelineStage } from './backend-tests/pipeline-simulator';
 import { Orchestrator } from './orchestrator';
-import { UIValidator } from './ui-validator';
-import { InspectraDB } from './inspectra-db';
-import { TestRunner } from './test-runner';
-import { logger } from './logger';
+import { UIValidator } from './frontend-tests/ui-validator';
+import { InspectraDB } from './core/inspectra-db';
+import { TestRunner } from './backend-tests/test-runner';
+import { logger } from './core/logger';
 let infraSocket: any = null; // dedicated slot for the VM infra-node socket
 
 const app = express();
@@ -338,25 +338,41 @@ app.get('/api/sessions/:id/download/csv', async (req, res) => {
     if (!session) return res.status(404).json({ error: 'Session not found' });
 
     const results = await inspectraDb.getResults(sessionId);
-    const testCases = await inspectraDb.getTestCases(sessionId);
 
-    const headers = ['Test ID', 'Service', 'Scenario', 'Barcode', 'Expected', 'Actual Status', 'Reason', 'Executed At'];
+    const headers = [
+      'Test ID', 'Service', 'Scenario', 'Barcode',
+      'Expected Status', 'Actual Status', 'Passed?',
+      'Rejection Code', 'Reason',
+      'UI Found?', 'UI Status', 'UI Rejection', 'UI Validation',
+      'Executed At'
+    ];
+
     const rows = results.map(r => {
-      const tc = testCases.find(t => t.testId === r.testId);
+      const rec = r as any;
+      const passed = rec.passed;
+      const passedLabel = passed === true ? 'YES ✅' : passed === false ? 'NO ❌' : '';
+      const uiFoundLabel = rec.uiFound === true ? 'YES' : rec.uiFound === false ? 'NO' : '';
       return [
         r.testId,
         r.service,
-        tc?.scenario || '',
+        rec.scenario || '',
         r.barcode,
-        tc?.expectedStatus || '',
+        rec.expectedStatus || '',
         r.status,
+        passedLabel,
+        rec.rejectionCode || '',
         `"${(r.reason || '').replace(/"/g, '""')}"`,
-        new Date(r.executedAt).toLocaleString()
+        uiFoundLabel,
+        rec.uiDisplayedStatus || '',
+        rec.uiDisplayedRejection || '',
+        rec.uiStatus || '',
+        new Date(r.executedAt).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
       ].join(',');
     });
 
     const csvContent = [headers.join(','), ...rows].join('\n');
-    const safeName = `Results_${sessionId}`.replace(/[^a-zA-Z0-9_\-]/g, '_');
+    const clientName = (session.clientName || 'report').replace(/[^a-zA-Z0-9_\-]/g, '_');
+    const safeName = `Results_${clientName}_${sessionId}`.replace(/[^a-zA-Z0-9_\-]/g, '_');
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}.csv"`);
     res.send('\uFEFF' + csvContent); // BOM for Excel compatibility

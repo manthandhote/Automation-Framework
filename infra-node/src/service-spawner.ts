@@ -39,6 +39,68 @@ interface ServiceEndpoint {
     port: number;
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Parse an existing .env file into a key→value map.
+ * Lines starting with # (comments) and blank lines are preserved as-is
+ * in the raw text but are skipped for the map.
+ */
+function parseEnvFile(envPath: string): Record<string, string> {
+    if (!fs.existsSync(envPath)) return {};
+    const lines = fs.readFileSync(envPath, 'utf8').split('\n');
+    const result: Record<string, string> = {};
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eqIdx = line.indexOf('=');
+        if (eqIdx === -1) continue;
+        const key = line.substring(0, eqIdx).trim();
+        const raw = line.substring(eqIdx + 1).trim();
+        // Strip surrounding single or double quotes so "machine_configurations"
+        // doesn't reach MongoDB with the quote characters included.
+        const val = raw.replace(/^(['"])(.*)\1$/, '$2');
+        result[key] = val;
+    }
+    return result;
+}
+
+/**
+ * Patch specific keys into an existing .env file.
+ * - Existing keys are updated in-place (preserving order and comments).
+ * - Keys not already present are appended at the end.
+ * - All other lines (comments, blanks, other keys) are left untouched.
+ */
+function patchEnvFile(envPath: string, patches: Record<string, string>): void {
+    const remaining = { ...patches };
+
+    let lines: string[] = fs.existsSync(envPath)
+        ? fs.readFileSync(envPath, 'utf8').split('\n')
+        : [];
+
+    // Update existing keys in-place
+    lines = lines.map(line => {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) return line;
+        const eqIdx = line.indexOf('=');
+        if (eqIdx === -1) return line;
+        const key = line.substring(0, eqIdx).trim();
+        if (key in remaining) {
+            const newLine = `${key}=${remaining[key]}`;
+            delete remaining[key];
+            return newLine;
+        }
+        return line;
+    });
+
+    // Append any keys that weren't already in the file
+    for (const [key, val] of Object.entries(remaining)) {
+        lines.push(`${key}=${val}`);
+    }
+
+    fs.writeFileSync(envPath, lines.join('\n'), 'utf8');
+}
+
 export class ServiceSpawner {
 
     // ── Public API ─────────────────────────────────────────────────────────────
@@ -74,7 +136,7 @@ export class ServiceSpawner {
             return { success: false, error: `Shared lib build failed: ${e.message}` };
         }
 
-        // 4. Build .env + PM2 app entry for each service
+        // 4. Patch .env + build PM2 app entry for each service
         const ecosystemApps: object[] = [];
 
         for (const svc of SERVICES) {
@@ -102,35 +164,27 @@ export class ServiceSpawner {
                 }
             }
 
-            // Build env vars
-            const envVars: Record<string, string> = {
+            // ── Patch .env (read existing → update only what we own) ──────────
+            const envFilePath = path.join(svcPath, '.env');
+
+            // Keys we always set for every service
+            const patches: Record<string, string> = {
                 PORT: port.toString(),
                 MONGO_URI: mongoUri,
                 MONGODB_URI: mongoUri,
-                NODE_ENV: 'development',
-                SESSION_ID: sessionId,
-                IS_SIMULATION: 'true',
-                MONGO_DB: svc.name === 'app-device-interface' ? 'machine_configurations' : dbName,
-                SORTING_DB: dbName,
-                INCOMING_DB: dbName,
-                MACHINE_CONFIG_DB: 'machine_configurations',
-                IDENTITY_DB: dbName,
-                CALIBRATION_DB: dbName,
-                NOTIFICATION_DB: dbName,
-                CYCLIC_DB: dbName,
-                UPLOADER_DB: dbName,
             };
 
+            // app-device-interface also gets MACHINE_ID from the user's selection
             if (svc.name === 'app-device-interface') {
-                envVars['MACHINE_ID'] = machineId;
-                envVars['MACHINE_KEY'] = machineKey;
+                patches['MACHINE_ID'] = machineId;
+                // MACHINE_KEY is intentionally NOT written — kept as-is in .env
             }
 
-            // Write .env file
-            fs.writeFileSync(
-                path.join(svcPath, '.env'),
-                Object.entries(envVars).map(([k, v]) => `${k}=${v}`).join('\n')
-            );
+            patchEnvFile(envFilePath, patches);
+            onLog(`[SPAWNER] ✅ .env patched for ${svc.name} (PORT=${port}, MONGO_URI set${svc.name === 'app-device-interface' ? `, MACHINE_ID=${machineId}` : ''})`);
+
+            // Read the final merged env to pass into PM2
+            const finalEnv = parseEnvFile(envFilePath);
 
             onLog(`[SPAWNER] ➡ ${svc.name} → port ${port}`);
 
@@ -144,7 +198,7 @@ export class ServiceSpawner {
                 exec_mode: 'fork',
                 instances: 1,
                 autorestart: false,
-                env: envVars,
+                env: finalEnv,      // ← PM2 gets the full patched .env, not a hand-rolled subset
             });
         }
 

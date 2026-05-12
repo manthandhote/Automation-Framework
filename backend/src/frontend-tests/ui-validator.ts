@@ -1,6 +1,6 @@
 import { chromium, Browser, Page } from 'playwright';
-import { logger } from './logger';
-import { BaselineManager } from './baseline-manager';
+import { logger } from '../core/logger';
+import { BaselineManager } from '../core/baseline-manager';
 
 export interface UIValidationResult {
   barcode: string;

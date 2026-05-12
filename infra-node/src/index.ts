@@ -60,7 +60,7 @@ socket.on('infra:setup-project', async (data: {
   backendBranch: string;
   frontendRepoUrl: string;
   frontendBranch: string;
-  patToken?: string;        // ← ADD THIS
+  patToken?: string;
 }, callback: Function) => {
 
   logger.info(`PAT received: ${data.patToken ? `YES (length: ${data.patToken.length})` : 'NO — undefined'}`);
@@ -117,22 +117,41 @@ socket.on('infra:spawn-services', async (data: {
 
 // ── Simulate hardware cycle ───────────────────────────────────────────────
 socket.on('infra:simulate-cycle', async (data: any, callback: Function) => {
-  logger.info(`Simulating cycle for ${data.barcode} on ${data.machineKey} (${data.protocol})`);
+  logger.info(`Simulating cycle for ${data.barcode} on ${data.machineKey} (edge: ${data.edgeProfile ?? 'NORMAL'})`);
   try {
-    const simulator = new MachineSimulator(data.transport, data.options);
-
-    simulator.on('packet', (packetStr) => {
-      socket.emit('simulator:packet', { data: packetStr });
+    // MachineSimulator now takes a single options object:
+    //   { host, port, machineKey }
+    // data.options may carry host/port from the host, data.machineKey is the machine identifier.
+    const simulator = new MachineSimulator({
+      host: data.options?.host ?? '127.0.0.1',
+      port: data.options?.port ?? 3000,
+      machineKey: data.machineKey ?? 'MA01',
     });
 
-    const result = await simulator.runFullCycle(
+    simulator.on('packet', (packetInfo) => {
+      socket.emit('simulator:packet', { data: packetInfo });
+    });
+
+    simulator.on('log', (msg: string) => {
+      socket.emit('infra:log', { message: msg });
+    });
+
+    // runCycle signature:
+    //   runCycle(barcode, dims, weight, edgeProfile, tidOverride?)
+    // Normalize dims: backend may send { l, b, h } or { l, w, h } — always produce valid { l, w, h }
+    const rawDims: any = data.dims ?? {};
+    const normDims = {
+      l: Number(rawDims.l) || 187,
+      w: Number(rawDims.w ?? rawDims.b) || 172,  // accept 'w' (width) OR 'b' (breadth)
+      h: Number(rawDims.h) || 47,
+    };
+    const result = await simulator.runCycle(
       data.barcode,
-      data.machineKey,
-      data.protocol,
-      data.dims,
-      data.weight,
-      data.edgeProfile
+      normDims,
+      data.weight ?? 0.12,
+      data.edgeProfile ?? 'NORMAL',
     );
+
     if (callback) callback({ success: true, result });
   } catch (err: any) {
     logger.error({ err }, 'Simulation cycle failed');
@@ -162,7 +181,6 @@ socket.on('infra:get-commit-info', async (data: { repoPath: string }, callback: 
     const util = require('util');
     const execP = util.promisify(execCb);
 
-    // Add safe.directory exception since repos might be owned by root
     await execP(`git config --global --add safe.directory ${repoPath}`, { timeout: 10000 }).catch(() => { });
 
     const { stdout } = await execP(
@@ -179,8 +197,8 @@ socket.on('infra:get-commit-info', async (data: { repoPath: string }, callback: 
 
 // ── Restore DB on VM ────────────────────────────────────────────────────────
 socket.on('infra:restore-db', async (payload: { archivePath: string; dbName: string }, callback: Function) => {
-  const { archivePath, dbName } = payload;
-  logger.info(`[restore-db] Restoring ${archivePath} → ${dbName}...`);
+  const { archivePath } = payload;
+  logger.info(`[restore-db] Restoring ${archivePath} into original archive DB names (--drop)...`);
 
   try {
     const { exec: execCb } = require('child_process');
@@ -195,14 +213,10 @@ socket.on('infra:restore-db', async (payload: { archivePath: string; dbName: str
     if (stderr && !stderr.includes('done')) {
       logger.warn(`[restore-db] stderr: ${stderr.split('\n')[0]}`);
     }
-    logger.info('[restore-db] ✅ Restore complete.');
+    logger.info('[restore-db] ✅ Restore complete — data is in original DB names.');
     if (callback) callback({ success: true });
   } catch (err: any) {
     logger.error(`[restore-db] Failed: ${err.message?.split('\n')[0]}`);
     if (callback) callback({ success: false, error: err.message });
   }
-});
-
-socket.on('disconnect', () => {
-  logger.info('Disconnected from Orchestrator.');
 });

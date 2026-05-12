@@ -12,7 +12,7 @@ export class ProcessManager {
     }
 
     logger.info(`Starting ${serviceName} on port ${port}...`);
-    
+
     const env = { ...process.env, PORT: port.toString() };
     const proc = spawn('npm', ['start'], {
       cwd: servicePath,

@@ -20,10 +20,10 @@ export interface CodeSummary {
 }
 
 export class CodeAnalyzer {
-  constructor(private csndPath: string) { }
+  constructor(private csndPath: string) {}
 
   async analyze(): Promise<CodeSummary> {
-    logger.info(`Analyzing cloned codebase at: ${this.csndPath}`);
+    logger.info(`Analyzing cloned codebase at: ${this.csndPath}`, 'CODE-ANALYZER');
 
     const services: ServiceInfo[] = [];
     const sharedLibs: string[] = [];
@@ -59,7 +59,7 @@ export class CodeAnalyzer {
       framework: 'npm workspaces monorepo'
     };
 
-    logger.info(`Found ${services.length} services: ${services.map(s => s.name).join(', ')}`);
+    logger.info(`Found ${services.length} services: ${services.map(s => s.name).join(', ')}`, 'CODE-ANALYZER');
     return summary;
   }
 
@@ -70,7 +70,6 @@ export class CodeAnalyzer {
     const models: string[] = [];
     let port: number | undefined;
 
-    // Try to read package.json for port hints
     const pkgPath = path.join(svcPath, 'package.json');
     if (fs.existsSync(pkgPath)) {
       try {
@@ -82,7 +81,6 @@ export class CodeAnalyzer {
       } catch { /* skip */ }
     }
 
-    // Guess port from service name
     if (!port) {
       const portMap: Record<string, number> = {
         'incoming-service': 7002,
@@ -97,36 +95,31 @@ export class CodeAnalyzer {
       port = portMap[name];
     }
 
-    // Walk src/ to find DB references and model files
     if (fs.existsSync(srcPath)) {
       this.walkDir(srcPath, (filePath) => {
         try {
           const content = fs.readFileSync(filePath, 'utf-8');
 
-          // Extract DB names from ENV references (MONGO_URI, DB names)
           const dbMatches = content.match(/ENV\.(\w+_DB)\b/g) || [];
           dbMatches.forEach(m => {
             const dbKey = m.replace('ENV.', '');
             if (!dbNames.includes(dbKey)) dbNames.push(dbKey);
           });
 
-          // Extract model names from Model files
-          if (filePath.includes('/models/') || filePath.includes('\\models\\')) {
+          if (filePath.includes('/models/')) {
             const modelMatch = path.basename(filePath, '.ts');
             if (!models.includes(modelMatch)) models.push(modelMatch);
           }
 
-          // Extract route endpoints
-          const routeMatches = content.match(/router\.(get|post|put|delete)\(['"`]([^'"`]+)['"`]/g) || [];
+          const routeMatches = content.match(/router\.(get|post|put|delete)\(['"` + '`' + `][^'"` + '`' + `]+['"` + '`' + `]/g) || [];
           routeMatches.forEach(r => {
-            const ep = r.match(/['"`]([^'"`]+)['"`]/);
+            const ep = r.match(/['"` + '`' + `]([^'"` + '`' + `]+)['"` + '`' + `]/);
             if (ep && !endpoints.includes(ep[1])) endpoints.push(ep[1]);
           });
 
-          // Also catch app.get/post patterns
-          const appRoutes = content.match(/app\.(get|post|put|delete)\(['"`]([^'"`]+)['"`]/g) || [];
+          const appRoutes = content.match(/app\.(get|post|put|delete)\(['"` + '`' + `][^'"` + '`' + `]+['"` + '`' + `]/g) || [];
           appRoutes.forEach(r => {
-            const ep = r.match(/['"`]([^'"`]+)['"`]/);
+            const ep = r.match(/['"` + '`' + `]([^'"` + '`' + `]+)['"` + '`' + `]/);
             if (ep && !endpoints.includes(ep[1])) endpoints.push(ep[1]);
           });
         } catch { /* skip unreadable */ }
@@ -138,7 +131,7 @@ export class CodeAnalyzer {
       port,
       hasDb: dbNames.length > 0,
       dbNames,
-      endpoints: endpoints.slice(0, 15), // cap for LLM context size
+      endpoints: endpoints.slice(0, 15),
       models
     };
   }
