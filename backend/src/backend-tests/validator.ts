@@ -19,19 +19,32 @@ export interface LayerResult {
   durationMs: number;
 }
 
+// ─── DB / Collection constants ────────────────────────────────────────────────
+const L1_DB = 'incoming_service';
+const L1_COLLECTION = 'incoming_data';
+
+const L2_DB = 'sorting_service';
+const L2_COLLECTION = 'primary_sortings';
+
+const L3_DB = 'data_uploader_service';
+const L3_COLLECTION = 'integration_logs';
+
 export class BackendValidator {
   private mongoUri: string;
-  private dbName: string;
 
-  constructor(mongoUri: string, sessionDbName: string) {
+  constructor(mongoUri: string, _sessionDbName?: string) {
+    // _sessionDbName kept for API compatibility but is no longer used for queries.
+    // Each layer now targets its own dedicated database.
     this.mongoUri = mongoUri;
-    this.dbName = sessionDbName;
   }
 
   async validateParcel(barcode: string, retries = 5, retryDelayMs = 1000): Promise<ValidationResult> {
     const startTime = Date.now();
 
-    logger.info(`[VALIDATOR] Validating barcode: ${barcode} in DB: ${this.dbName}`, 'VALIDATOR');
+    logger.info(
+      `[VALIDATOR] Validating barcode: ${barcode} across [${L1_DB}, ${L2_DB}, ${L3_DB}]`,
+      'VALIDATOR'
+    );
 
     const layer1 = await this.retryCheck(
       () => this.checkLayer1(barcode),
@@ -66,119 +79,114 @@ export class BackendValidator {
     };
   }
 
-  // ─── Layer 1: Ingestion ────────────────────────────────────────────────────
-  // Checks that the incoming-service received and stored the barcode
+  // ─── Layer 1: Ingestion ───────────────────────────────────────────────────
+  // DB:  incoming_service
+  // Col: incoming_data
+  // Key: awb  (no top-level barcode field in this collection)
   private async checkLayer1(barcode: string): Promise<LayerResult> {
     const start = Date.now();
-    const collections = ['incoming_data', 'incoming_packets', 'incomingdata'];
-
-    for (const col of collections) {
-      try {
-        const result = await this.findInDb(col, barcode);
-        if (result) {
-          return {
-            layer: 'Layer1-Ingestion',
-            collection: col,
-            found: true,
-            data: result,
-            durationMs: Date.now() - start
-          };
-        }
-      } catch (e) { }
+    try {
+      const result = await this.findInDb(
+        L1_DB,
+        L1_COLLECTION,
+        { awb: barcode }
+      );
+      return {
+        layer: 'Layer1-Ingestion',
+        collection: L1_COLLECTION,
+        found: !!result,
+        data: result ?? undefined,
+        error: result ? undefined : 'AWB not found in incoming_data',
+        durationMs: Date.now() - start
+      };
+    } catch (e: any) {
+      return {
+        layer: 'Layer1-Ingestion',
+        collection: L1_COLLECTION,
+        found: false,
+        error: e.message,
+        durationMs: Date.now() - start
+      };
     }
-
-    return {
-      layer: 'Layer1-Ingestion',
-      collection: 'incoming_data',
-      found: false,
-      error: 'Not found in any incoming collection',
-      durationMs: Date.now() - start
-    };
   }
 
-  // ─── Layer 2: Sorting ──────────────────────────────────────────────────────
-  // Checks that validation-engine processed and stored sorting result
+  // ─── Layer 2: Sorting ─────────────────────────────────────────────────────
+  // DB:  sorting_service
+  // Col: primary_sortings
+  // Key: barcode (primary) | awb (fallback — same value, belt-and-suspenders)
   private async checkLayer2(barcode: string): Promise<LayerResult> {
     const start = Date.now();
-    const collections = ['sorting_results', 'primary_sortings', 'sorting_data'];
-
-    for (const col of collections) {
-      try {
-        const result = await this.findInDb(col, barcode);
-        if (result) {
-          return {
-            layer: 'Layer2-Sorting',
-            collection: col,
-            found: true,
-            data: result,
-            durationMs: Date.now() - start
-          };
-        }
-      } catch (e) { }
+    try {
+      const result = await this.findInDb(
+        L2_DB,
+        L2_COLLECTION,
+        { $or: [{ barcode }, { awb: barcode }] }
+      );
+      return {
+        layer: 'Layer2-Sorting',
+        collection: L2_COLLECTION,
+        found: !!result,
+        data: result ?? undefined,
+        error: result ? undefined : 'Barcode not found in primary_sortings',
+        durationMs: Date.now() - start
+      };
+    } catch (e: any) {
+      return {
+        layer: 'Layer2-Sorting',
+        collection: L2_COLLECTION,
+        found: false,
+        error: e.message,
+        durationMs: Date.now() - start
+      };
     }
-
-    return {
-      layer: 'Layer2-Sorting',
-      collection: 'sorting_results',
-      found: false,
-      error: 'Not found in any sorting collection',
-      durationMs: Date.now() - start
-    };
   }
 
-  // ─── Layer 3: Integration/Upload ──────────────────────────────────────────
-  // Checks that dataposting-service logged the upload
+  // ─── Layer 3: Integration / Upload ────────────────────────────────────────
+  // DB:  data_uploader_service
+  // Col: integration_logs
+  // Key: request.body.waybill_no  (barcode is nested — NOT a top-level field)
   private async checkLayer3(barcode: string): Promise<LayerResult> {
     const start = Date.now();
-    const collections = ['integration_logs', 'upload_logs', 'datapost_logs'];
-
-    for (const col of collections) {
-      try {
-        const result = await this.findInDb(col, barcode);
-        if (result) {
-          return {
-            layer: 'Layer3-Integration',
-            collection: col,
-            found: true,
-            data: result,
-            durationMs: Date.now() - start
-          };
-        }
-      } catch (e) { }
+    try {
+      const result = await this.findInDb(
+        L3_DB,
+        L3_COLLECTION,
+        { 'request.body.waybill_no': barcode }
+      );
+      return {
+        layer: 'Layer3-Integration',
+        collection: L3_COLLECTION,
+        found: !!result,
+        data: result ?? undefined,
+        error: result ? undefined : 'Waybill not found in integration_logs (may not have uploaded yet)',
+        durationMs: Date.now() - start
+      };
+    } catch (e: any) {
+      return {
+        layer: 'Layer3-Integration',
+        collection: L3_COLLECTION,
+        found: false,
+        error: e.message,
+        durationMs: Date.now() - start
+      };
     }
-
-    return {
-      layer: 'Layer3-Integration',
-      collection: 'integration_logs',
-      found: false,
-      error: 'Not found in integration logs (may not have uploaded yet)',
-      durationMs: Date.now() - start
-    };
   }
 
-  // ─── DB helper ────────────────────────────────────────────────────────────
-  private async findInDb(collection: string, barcode: string): Promise<any | null> {
+  // ─── DB helper ───────────────────────────────────────────────────────────
+  // Now accepts explicit dbName + collection + query per call.
+  // No more shared this.dbName across all layers.
+  private async findInDb(dbName: string, collection: string, query: object): Promise<any | null> {
     const client = new MongoClient(this.mongoUri);
     try {
       await client.connect();
-      const db = client.db(this.dbName);
-
-      const result = await db.collection(collection).findOne({
-        $or: [
-          { barcode },
-          { awb: barcode },
-          { barcode_data: { $elemMatch: { barcode } } },
-          { 'barcode_data.barcode': barcode }
-        ]
-      });
-
+      const result = await client.db(dbName).collection(collection).findOne(query);
       return result;
     } finally {
       await client.close();
     }
   }
 
-  // ─── Retry wrapper ─────────────────────────────────────────────────────────
+  // ─── Retry wrapper ────────────────────────────────────────────────────────
   private async retryCheck(
     fn: () => Promise<LayerResult>,
     retries: number,

@@ -1,6 +1,9 @@
 import { chromium, Browser, Page } from 'playwright';
 import { logger } from '../core/logger';
 import { BaselineManager } from '../core/baseline-manager';
+import * as fs from 'fs';
+import * as path from 'path';
+
 
 export interface UIValidationResult {
   barcode: string;
@@ -8,6 +11,7 @@ export interface UIValidationResult {
   displayedStatus?: string;
   displayedRejectionCode?: string;
   status: 'PASS' | 'FAIL' | 'HEALED' | 'ERROR';
+  screenshotPath?: string;
   reason?: string;
   durationMs: number;
 }
@@ -20,21 +24,31 @@ export class UIValidator {
     this.baselineMgr = new BaselineManager();
   }
 
+  // screenshotsDir is now passed in explicitly from the test runner.
+  // This ensures screenshots always land inside the correct run_<sessionId>/screenshots/
+  // folder regardless of what process.cwd() resolves to.
   async validateParcelDisplay(
     baseUrl: string,
     barcode: string,
     runId: string,
     commitId: string,
-    apiResponse?: any
+    apiResponse?: any,
+    screenshotsDir?: string   // ← new optional param; falls back to cwd-based path if omitted
   ): Promise<UIValidationResult> {
     const startTime = Date.now();
     let page: Page | null = null;
 
     const feHost = process.env.VM_HOST || '192.168.5.216';
 
+    // Resolve screenshot directory:
+    // 1. Use the explicitly passed-in dir (from test-runner, always correct).
+    // 2. Fall back to cwd-based path only if caller didn't pass one.
+    const resolvedScreenshotDir = screenshotsDir
+      ?? path.join(process.cwd(), 'runs', `run_${runId}`, 'screenshots');
+
     try {
       if (!this.browser) {
-        this.browser = await chromium.launch({ headless: true });
+        this.browser = await chromium.launch({ headless: false });
       }
 
       const context = await this.browser.newContext();
@@ -223,6 +237,18 @@ export class UIValidator {
         }
       }
 
+      // ─────────────────────────────────────────────────
+      // SCREENSHOT
+      // Save to the explicitly resolved directory so all screenshots
+      // from a run always end up in the same run_<sessionId>/screenshots/ folder.
+      // ─────────────────────────────────────────────────
+      if (!fs.existsSync(resolvedScreenshotDir)) {
+        fs.mkdirSync(resolvedScreenshotDir, { recursive: true });
+      }
+      const screenshotPath = path.join(resolvedScreenshotDir, `${barcode}.png`);
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+      logger.info(`[UI-VALIDATOR] Screenshot saved to ${screenshotPath}`, 'UI-VALIDATOR');
+
       await context.close();
 
       return {
@@ -231,6 +257,7 @@ export class UIValidator {
         displayedStatus,
         displayedRejectionCode,
         status: healedSearch ? 'HEALED' : (parcelFound ? 'PASS' : 'FAIL'),
+        screenshotPath,
         reason: healedSearch
           ? 'Search selector healed dynamically'
           : parcelFound
@@ -241,11 +268,27 @@ export class UIValidator {
 
     } catch (err: any) {
       logger.warn(`[UI-VALIDATOR] Failed for ${barcode}: ${err.message}`, 'UI-VALIDATOR');
-      if (page) await page.context().close();
+
+      let screenshotPath: string | undefined;
+      if (page) {
+        try {
+          if (!fs.existsSync(resolvedScreenshotDir)) {
+            fs.mkdirSync(resolvedScreenshotDir, { recursive: true });
+          }
+          screenshotPath = path.join(resolvedScreenshotDir, `${barcode}_error.png`);
+          await page.screenshot({ path: screenshotPath, fullPage: true });
+          logger.info(`[UI-VALIDATOR] Error screenshot saved to ${screenshotPath}`, 'UI-VALIDATOR');
+        } catch (e: any) {
+          logger.warn(`[UI-VALIDATOR] Failed to capture error screenshot: ${e.message}`, 'UI-VALIDATOR');
+        }
+        await page.context().close();
+      }
+
       return {
         barcode,
         found: false,
         status: 'ERROR',
+        screenshotPath,
         reason: err.message,
         durationMs: Date.now() - startTime
       };

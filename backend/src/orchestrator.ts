@@ -9,7 +9,7 @@ import { TestRunner } from './backend-tests/test-runner';
 //import { AdvancedSimulator } from './backend-tests/platform/advanced-simulator';
 //import { LifecycleValidator } from './backend-tests/platform/lifecycle-validator';
 import { E2ETestRunner, E2EReport } from './backend-tests/platform/e2e-test-runner';
-//import { MongoClient } from 'mongodb';
+import { MongoClient } from 'mongodb';
 //import { spawn, ChildProcess, exec } from 'child_process';
 import { exec, ChildProcess } from 'child_process';
 import util from 'util';
@@ -411,7 +411,22 @@ location /SIM/ {
     const session = await this.inspectraDb.getSession(sessionId);
     if (!session) throw new Error('Session not found');
 
-    const testCases = await this.inspectraDb.getTestCases(sessionId);
+    let testCases = await this.inspectraDb.getTestCases(sessionId);
+
+    // Load from JSON file if exists
+    const testCasesPath = path.join(this.workspacePath, 'backend', 'test-data', 'test-cases.json');
+    if (fs.existsSync(testCasesPath)) {
+      try {
+        const fileContent = fs.readFileSync(testCasesPath, 'utf8');
+        const jsonCases = JSON.parse(fileContent);
+        if (Array.isArray(jsonCases) && jsonCases.length > 0) {
+          testCases = jsonCases;
+          onLog(`[ORCHESTRATOR] Loaded ${testCases.length} test cases from test-cases.json`);
+        }
+      } catch (err: any) {
+        onLog(`[ERROR] Failed to parse test-cases.json: ${err.message}`);
+      }
+    }
     const dbName = session.restoredDbName || 'inspectra_csnd';
 
     const dbAnalyzer = new DbAnalyzer(this.testDbUri, dbName);
@@ -590,6 +605,34 @@ location /SIM/ {
     }
   }
 
+  private async cleanupSortingDatabase(onLog: (msg: string) => void) {
+    const client = new MongoClient(this.testDbUri);
+    try {
+      await client.connect();
+      const db = client.db('sorting_service');
+
+      onLog(`[ORCHESTRATOR] Clearing primary_sortings...`);
+      await db.collection('primary_sortings').deleteMany({});
+
+      onLog(`[ORCHESTRATOR] Resetting active_bags...`);
+      await db.collection('active_bags').updateMany({}, {
+        $set: {
+          items: [],
+          rejected_items: [],
+          delinked_items: [],
+          "count_data.allocated": 0, "count_data.scanned": 0, "count_data.balance": 0, "count_data.free": 0, "count_data.occupancy": 0,
+          "weight_data.allocated": 0, "weight_data.scanned": 0, "weight_data.balance": 0, "weight_data.free": 0, "weight_data.occupancy": 0,
+          "volume_data.allocated": 0, "volume_data.scanned": 0, "volume_data.balance": 0, "volume_data.free": 0, "volume_data.occupancy": 0,
+          "volume_weight_data.allocated": 0, "volume_weight_data.scanned": 0, "volume_weight_data.balance": 0, "volume_weight_data.free": 0, "volume_weight_data.occupancy": 0
+        }
+      });
+
+      onLog(`[ORCHESTRATOR] Database cleanup complete.`);
+    } finally {
+      await client.close();
+    }
+  }
+
   private async executePhase(
     sessionId: string,
     bePath: string,
@@ -601,6 +644,13 @@ location /SIM/ {
     selectedMachineId?: string
   ) {
     onProgress?.('Starting VM Services', 78);
+
+    // ── Pre-execution Cleanup ──────────────────────────────────────────────
+    try {
+      await this.cleanupSortingDatabase(onLog);
+    } catch (e: any) {
+      onLog?.(`[WARNING] Failed to cleanup DB before test run: ${e.message}`);
+    }
 
     // ── Spawn services on VM first ─────────────────────────────────────────
     const selectedMachine = selectedMachineId
@@ -634,6 +684,19 @@ location /SIM/ {
     const passed = results.filter(r => r.passed).length;
     const failed = results.filter(r => !r.passed).length;
     onLog?.(`[ORCHESTRATOR] ✅ Tests complete: ${passed} passed, ${failed} failed`);
+
+    // Output results to JSON
+    try {
+      const runDir = path.join(this.workspacePath, 'runs', `run_${sessionId}`);
+      if (!fs.existsSync(runDir)) {
+        fs.mkdirSync(runDir, { recursive: true });
+      }
+      const resultsPath = path.join(runDir, 'test-results.json');
+      fs.writeFileSync(resultsPath, JSON.stringify(results, null, 2), 'utf8');
+      onLog?.(`[ORCHESTRATOR] Test results saved to ${resultsPath}`);
+    } catch (err: any) {
+      onLog?.(`[ERROR] Failed to save test-results.json: ${err.message}`);
+    }
 
     await this.inspectraDb.updateSession(sessionId, {
       status: failed === 0 ? 'COMPLETED' : 'FAILED',

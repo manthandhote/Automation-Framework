@@ -44,7 +44,7 @@ export class LlamaAnalyst {
 
   // ─── Core request helper ─────────────────────────────────────────────────────
   private async ask(prompt: string, expectJson: boolean = true, retries: number = 3): Promise<string> {
-    const timeout = Number(process.env.LLM_TIMEOUT_MS) || 5000;
+    const timeout = Number(process.env.LLM_TIMEOUT_MS) || 300000;
 
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {
@@ -172,15 +172,15 @@ export class LlamaAnalyst {
     logger.info(`Analyzing codebase structure (${codeSummary.totalServices} services)...`, 'AI');
 
     const prompt = `You are an expert software architect reviewing a CSND logistics automation system.
-Here is a structured summary of the cloned codebase:
-${JSON.stringify(codeSummary, null, 2)}
+      Here is a structured summary of the cloned codebase:
+      ${JSON.stringify(codeSummary, null, 2)}
 
-Provide a concise paragraph (max 5 sentences) describing:
-1. The overall architecture and key microservices
-2. The data flow between services
-3. Any notable patterns or concerns for automated testing
+      Provide a concise paragraph (max 5 sentences) describing:
+      1. The overall architecture and key microservices
+      2. The data flow between services
+      3. Any notable patterns or concerns for automated testing
 
-Return plain text only, no JSON, no markdown.`;
+      Return plain text only, no JSON, no markdown.`;
 
     try {
       return await this.ask(prompt, false);
@@ -195,15 +195,15 @@ Return plain text only, no JSON, no markdown.`;
     logger.info(`Analyzing database (${dbSummary.totalMachines} machines)...`, 'AI');
 
     const prompt = `You are a QA expert for a CSND sortation system.
-Here is the database structure extracted from the system's MongoDB backup:
-${JSON.stringify(dbSummary, null, 2)}
+      Here is the database structure extracted from the system's MongoDB backup:
+      ${JSON.stringify(dbSummary, null, 2)}
 
-Provide a concise paragraph (max 5 sentences) describing:
-1. What machines are configured and what types they are
-2. What client integrations exist (push/pull/fetch configs)
-3. Which services and collections are most critical for testing
+      Provide a concise paragraph (max 5 sentences) describing:
+      1. What machines are configured and what types they are
+      2. What client integrations exist (push/pull/fetch configs)
+      3. Which services and collections are most critical for testing
 
-Return plain text only, no JSON, no markdown.`;
+      Return plain text only, no JSON, no markdown.`;
 
     try {
       return await this.ask(prompt, false);
@@ -349,7 +349,7 @@ Return plain text only, no JSON, no markdown.`;
           testId: `TC-${String(idx++).padStart(3, '0')}`,
           service: 'app-device-interface',
           scenario: 'duplicate_scan',
-          description: `Same AWB fed twice → expect SBRR`,
+          description: `Same AWB fed twice → expect (FAIL) DUPR `,
           expectedStatus: 'FAIL',
           expectedSortCode: 'SBRR',
           barcode: ctx.validAwb,
@@ -366,7 +366,7 @@ Return plain text only, no JSON, no markdown.`;
         testId: `TC-${String(idx++).padStart(3, '0')}`,
         service: 'app-device-interface',
         scenario: 'dnf_rejection',
-        description: `Valid format AWB not in DB → expect DNFR`,
+        description: `Valid format AWB not in DB → expect (FAIL) DNFR`,
         expectedStatus: 'FAIL',
         expectedSortCode: 'DNFR',
         barcode: ctx.fakeAwb,
@@ -382,7 +382,7 @@ Return plain text only, no JSON, no markdown.`;
         testId: `TC-${String(idx++).padStart(3, '0')}`,
         service: 'app-device-interface',
         scenario: 'invalid_barcode',
-        description: `Barcode fails regex → expect IBAR`,
+        description: `Barcode fails regex → expect (FAIL) IBAR`,
         expectedStatus: 'FAIL',
         expectedSortCode: 'IBAR',
         barcode: 'INVALID000',

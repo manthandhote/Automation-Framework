@@ -1,0 +1,74 @@
+[
+  {
+    "testId": "TC-001",
+    "service": "app-device-interface",
+    "scenario": "normal_flow",
+    "description": "AWB exists in incoming_data → expect SUCC",
+    "expectedStatus": "PASS",
+    "expectedSortCode": "SUCC",
+    "barcode": "VL0084086426910",
+    "machineName": "MA01",
+    "configName": "normal_flow",
+    "isDuplicate": false,
+    "dims": {
+      "l": 187,
+      "b": 172,
+      "h": 47
+    },
+    "weight": 0.12
+  },
+  {
+    "testId": "TC-002",
+    "service": "app-device-interface",
+    "scenario": "duplicate_scan",
+    "description": "AWB already fully sorted → re-feed must produce DUPR",
+    "expectedStatus": "PASS",
+    "expectedSortCode": "DUPR",
+    "barcode": "VL0084086426910",
+    "machineName": "MA01",
+    "configName": "duplicate_scan",
+    "isDuplicate": true,
+    "dims": {
+      "l": 187,
+      "b": 172,
+      "h": 47
+    },
+    "weight": 0.12
+  },
+  {
+    "testId": "TC-003",
+    "service": "app-device-interface",
+    "scenario": "dnf_rejection",
+    "description": "Valid format AWB not in DB → expect DNFR",
+    "expectedStatus": "FAIL",
+    "expectedSortCode": "DNFR",
+    "barcode": "VAL8580110764",
+    "machineName": "MA01",
+    "configName": "dnf_rejection",
+    "isDuplicate": false,
+    "dims": {
+      "l": 187,
+      "b": 172,
+      "h": 47
+    },
+    "weight": 0.12
+  },
+  {
+    "testId": "TC-004",
+    "service": "app-device-interface",
+    "scenario": "invalid_barcode",
+    "description": "Barcode fails regex → expect IBAR",
+    "expectedStatus": "FAIL",
+    "expectedSortCode": "IBAR",
+    "barcode": "INVALID000",
+    "machineName": "MA01",
+    "configName": "invalid_barcode",
+    "isDuplicate": false,
+    "dims": {
+      "l": 187,
+      "b": 172,
+      "h": 47
+    },
+    "weight": 0.12
+  }
+]
