@@ -28,17 +28,6 @@ function runCommand(command, cwd, description) {
 }
 
 async function main() {
-    // 1. Kill any running Node.js processes (EXCEPT THIS ONE)
-    console.log('[STARTUP] Cleaning up existing Node.js processes...');
-    try {
-        const currentPid = process.pid;
-        const killCmd = `powershell -Command "Get-Process node -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne ${currentPid} } | Stop-Process -Force"`;
-        execSync(killCmd, { stdio: 'ignore' });
-    } catch (e) { }
-
-    // 2. Add a 2-second delay
-    console.log('[STARTUP] Waiting 2 seconds for process cleanup...');
-    await new Promise(resolve => setTimeout(resolve, 2000));
 
     // 4. Install root dependencies
     runCommand('npm install --ignore-scripts', FRAMEWORK_ROOT, 'Installing root dependencies');

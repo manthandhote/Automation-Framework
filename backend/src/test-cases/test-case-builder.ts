@@ -132,7 +132,50 @@ export class TestCaseBuilder {
       `[TEST-BUILDER] Passing ${realAwbs.length} machine contexts to LLM`,
       'TEST-BUILDER'
     );
-    return await this.llama.generateTestCases(codeSummary, dbSummary, realAwbs);
+    const cases = await this.llama.generateTestCases(codeSummary, dbSummary, realAwbs);
+
+    // ── Force-inject real barcodes after LLM responds ─────────────────────
+    // LLM sometimes hallucinates barcodes even when given the real ones.
+    // We override here in code so it's deterministic regardless of LLM output.
+    for (const ctx of realAwbs) {
+      if (!ctx.validAwb) continue;
+
+      // TC-001 equivalent: normal_flow → must use a real AWB from incoming_data
+      const normalCase = cases.find(c =>
+        !c.isDuplicate &&
+        (c.scenario === 'normal_flow' || c.expectedSortCode === 'SUCC') &&
+        c.machineId === ctx.machineId
+      );
+      if (normalCase) {
+        if (normalCase.barcode !== ctx.validAwb) {
+          logger.warn(
+            `[TEST-BUILDER] Overriding hallucinated barcode "${normalCase.barcode}" → "${ctx.validAwb}" for ${normalCase.testId}`,
+            'TEST-BUILDER'
+          );
+        }
+        normalCase.barcode = ctx.validAwb;
+      }
+
+      // TC-004 equivalent: duplicate_scan → must use the same real AWB as TC-001
+      const duplicateCase = cases.find(c =>
+        c.isDuplicate && c.machineId === ctx.machineId
+      );
+      if (duplicateCase) {
+        duplicateCase.barcode = ctx.validAwb;
+      }
+
+      // TC-002 equivalent: dnf_rejection → must use the generated fake AWB (not from DB)
+      const dnfCase = cases.find(c =>
+        !c.isDuplicate &&
+        (c.scenario === 'dnf_rejection' || c.expectedSortCode === 'DNFR') &&
+        c.machineId === ctx.machineId
+      );
+      if (dnfCase && ctx.fakeAwb) {
+        dnfCase.barcode = ctx.fakeAwb;
+      }
+    }
+
+    return cases;
   }
 
   private generateFakeAwb(regexStr: string): string {

@@ -10,6 +10,13 @@ import { ProcessManager } from './process-manager';
 import { MachineSimulator } from './simulator';
 import { logger } from './logger';
 
+function injectGithubToken(url: string): string {
+  const token = process.env.GITHUB_TOKEN;
+  if (!token) return url;
+  if (url.includes('@')) return url; // token already embedded
+  return url.replace('https://', `https://${token}@`);
+}
+
 const ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL || 'http://localhost:3000';
 const socket: Socket = io(ORCHESTRATOR_URL);
 const processManager = new ProcessManager();
@@ -42,6 +49,74 @@ socket.on('connect', async () => {
     mongo: mongoStatus ? 'installed' : 'not installed',
     status: (nginxStatus && phpStatus && gitStatus && mongoStatus) ? 'PASS' : 'FAIL'
   });
+});
+// ── Clone DB repo on VM and return client folder list ─────────────────────
+socket.on('infra:clone-db-repo', async (
+  payload: { repoUrl: string },
+  callback: Function
+) => {
+  const repoUrl = injectGithubToken(payload.repoUrl);
+  logger.info(`[clone-db-repo] Cloning/updating repo on VM...`);
+
+  try {
+    const { exec: execCb } = require('child_process');
+    const util = require('util');
+    const fs = require('fs');
+    const path = require('path');
+    const execP = util.promisify(execCb);
+
+    const repoLocalPath = '/tmp/db-repo';
+
+    if (fs.existsSync(path.join(repoLocalPath, '.git'))) {
+      logger.info('[restore-db] Repo already cloned — resetting to latest...');
+      try {
+        // Update stored origin URL to include token (fixes stale credential-free URL)
+        await execP(`git -C "${repoLocalPath}" remote set-url origin "${repoUrl}"`, { timeout: 5000 });
+        await execP(`git -C "${repoLocalPath}" fetch origin`, { timeout: 60000 });
+        await execP(`git -C "${repoLocalPath}" reset --hard origin/HEAD`, { timeout: 10000 });
+      } catch (fetchErr: any) {
+        logger.warn(`[restore-db] Fetch failed — using existing clone as-is. ${fetchErr.message?.split('\n')[0]}`);
+      }
+    } else {
+      logger.info(`[clone-db-repo] Fresh clone...`);
+      if (fs.existsSync(repoLocalPath)) {
+        fs.rmSync(repoLocalPath, { recursive: true, force: true });
+      }
+      await execP(`git clone "${repoUrl}" "${repoLocalPath}"`, { timeout: 180000 });
+    }
+
+    // Walk configs/ to find all client folders (same logic as before)
+    const configsPath = path.join(repoLocalPath, 'configs');
+    if (!fs.existsSync(configsPath)) {
+      return callback({ success: false, error: 'No "configs" folder found in repo root.' });
+    }
+
+    const clients: string[] = [];
+    const walk = (dir: string, prefix: string) => {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      const hasCollections = entries.some((e: any) => e.isDirectory() && e.name === 'collections');
+      if (hasCollections) { clients.push(prefix); return; }
+      for (const entry of entries) {
+        if (entry.isDirectory() && entry.name !== 'collections') {
+          walk(path.join(dir, entry.name), prefix ? `${prefix}/${entry.name}` : entry.name);
+        }
+      }
+    };
+
+    const topLevel = fs.readdirSync(configsPath, { withFileTypes: true });
+    for (const entry of topLevel) {
+      if (entry.isDirectory()) {
+        walk(path.join(configsPath, entry.name), entry.name);
+      }
+    }
+
+    logger.info(`[clone-db-repo] Found ${clients.length} client(s): ${clients.join(', ')}`);
+    callback({ success: true, clients });
+
+  } catch (err: any) {
+    logger.error(`[clone-db-repo] Failed: ${err.message?.split('\n')[0]}`);
+    callback({ success: false, error: err.message });
+  }
 });
 
 socket.on('infra:start-service', (data: { serviceName: string, servicePath: string, port: number }) => {
@@ -196,27 +271,125 @@ socket.on('infra:get-commit-info', async (data: { repoPath: string }, callback: 
 });
 
 // ── Restore DB on VM ────────────────────────────────────────────────────────
-socket.on('infra:restore-db', async (payload: { archivePath: string; dbName: string }, callback: Function) => {
-  const { archivePath } = payload;
-  logger.info(`[restore-db] Restoring ${archivePath} into original archive DB names (--drop)...`);
+//
+//  NEW FLOW (replaces mongorestore --archive):
+//
+//  Payload: { repoUrl: string, clientFolder: string }
+//
+//  Steps:
+//    1. Clone / pull the DataBase_Reference GitHub repo into /tmp/db-repo
+//    2. Resolve the collections folder:
+//         /tmp/db-repo/configs/<clientFolder>/collections/
+//    3. For every *.json file in that folder, derive db + collection from
+//       the filename convention:
+//         <db_name>.<collection_name>.json
+//         e.g. incoming_service.incoming_config.json
+//              → mongoimport --db incoming_service --collection incoming_config
+//    4. Run mongoimport --drop --jsonArray for each file.
+//    5. ACK the orchestrator when done (or forward the error).
+//
+// ────────────────────────────────────────────────────────────────────────────
+socket.on('infra:restore-db', async (
+  payload: { repoUrl: string; clientFolder: string },
+  callback: Function
+) => {
+  const repoUrl = injectGithubToken(payload.repoUrl);
+  const { clientFolder } = payload;
+  logger.info(`[restore-db] repo=<token-injected>  client=${clientFolder}`);
 
   try {
     const { exec: execCb } = require('child_process');
     const util = require('util');
+    const fs = require('fs');
+    const path = require('path');
     const execP = util.promisify(execCb);
 
-    const { stdout, stderr } = await execP(
-      `mongorestore --uri="mongodb://127.0.0.1:27017" \
-       --archive="${archivePath}" --drop`,
-      { timeout: 300000 }
-    );
-    if (stderr && !stderr.includes('done')) {
-      logger.warn(`[restore-db] stderr: ${stderr.split('\n')[0]}`);
+    // ── 1. Clone or pull ────────────────────────────────────────────────
+    const repoLocalPath = '/tmp/db-repo';
+
+    if (fs.existsSync(path.join(repoLocalPath, '.git'))) {
+      logger.info('[restore-db] Repo already cloned — resetting to latest...');
+      try {
+        // Update stored origin URL to include token (fixes stale credential-free URL)
+        await execP(`git -C "${repoLocalPath}" remote set-url origin "${repoUrl}"`, { timeout: 5000 });
+        await execP(`git -C "${repoLocalPath}" fetch origin`, { timeout: 60000 });
+        await execP(`git -C "${repoLocalPath}" reset --hard origin/HEAD`, { timeout: 10000 });
+      } catch (fetchErr: any) {
+        logger.warn(`[restore-db] Fetch failed — using existing clone as-is. ${fetchErr.message?.split('\n')[0]}`);
+      }
+    } else {
+      logger.info(`[restore-db] Cloning ${repoUrl} ...`);
+      if (fs.existsSync(repoLocalPath)) {
+        fs.rmSync(repoLocalPath, { recursive: true, force: true });
+      }
+      await execP(`git clone "${repoUrl}" "${repoLocalPath}"`, { timeout: 180000 });
     }
-    logger.info('[restore-db] ✅ Restore complete — data is in original DB names.');
+
+    // ── 2. Locate the collections folder ───────────────────────────────
+    const collectionsPath = path.join(repoLocalPath, 'configs', clientFolder, 'collections');
+
+    if (!fs.existsSync(collectionsPath)) {
+      throw new Error(
+        `collections folder not found at configs/${clientFolder}/collections — ` +
+        `check the clientFolder value sent from the orchestrator.`
+      );
+    }
+
+    // ── 3. Enumerate JSON files ─────────────────────────────────────────
+    const files: string[] = fs
+      .readdirSync(collectionsPath)
+      .filter((f: string) => f.endsWith('.json'));
+
+    if (files.length === 0) {
+      throw new Error(`No .json files found in ${collectionsPath}`);
+    }
+
+    logger.info(`[restore-db] Found ${files.length} collection file(s) — starting import...`);
+
+    // ── 4. mongoimport per file ─────────────────────────────────────────
+    for (const file of files) {
+      // filename format: <db>.<collection>.json
+      // Split on the FIRST dot only to handle db names that don't contain dots,
+      // then treat everything between the first and last dot as the collection.
+      const withoutExt = file.slice(0, -5);          // strip .json
+      const firstDot = withoutExt.indexOf('.');
+      if (firstDot === -1) {
+        logger.warn(`[restore-db] Skipping "${file}" — does not match <db>.<collection>.json`);
+        continue;
+      }
+
+      const dbName = withoutExt.slice(0, firstDot);
+      const collectionName = withoutExt.slice(firstDot + 1);
+      const filePath = path.join(collectionsPath, file);
+
+      logger.info(`[restore-db]   importing ${dbName} → ${collectionName} from ${file}`);
+
+      const { stderr } = await execP(
+        `mongoimport \
+          --uri="mongodb://127.0.0.1:27017" \
+          --db="${dbName}" \
+          --collection="${collectionName}" \
+          --drop \
+          --jsonArray \
+          --file="${filePath}"`,
+        { timeout: 120000 }
+      );
+
+      // mongoimport writes progress to stderr — only log real problems
+      if (stderr) {
+        const firstLine = stderr.split('\n')[0];
+        if (!firstLine.toLowerCase().includes('connected') &&
+          !firstLine.toLowerCase().includes('imported')) {
+          logger.warn(`[restore-db] mongoimport stderr (${file}): ${firstLine}`);
+        }
+      }
+    }
+
+    logger.info('[restore-db] ✅ All collections restored via mongoimport.');
     if (callback) callback({ success: true });
+
   } catch (err: any) {
-    logger.error(`[restore-db] Failed: ${err.message?.split('\n')[0]}`);
+    logger.error(`[restore-db] ❌ Failed: ${err.message?.split('\n')[0]}`);
     if (callback) callback({ success: false, error: err.message });
   }
 });

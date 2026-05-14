@@ -58,8 +58,6 @@ export class LlamaAnalyst {
 
         let text: string = response.data.response || '';
         console.log('\n================ LLM RAW RESPONSE ================\n');
-        console.log(text);
-        console.log('\n=================================================\n');
         logger.info(`[AI] Got response (${text.length} chars)`, 'AI');
         text = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
         return text;

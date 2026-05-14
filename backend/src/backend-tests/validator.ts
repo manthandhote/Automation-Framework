@@ -65,7 +65,7 @@ export class BackendValidator {
     // Layer 3 is best-effort — not all flows upload
 
     logger.info(
-      `[VALIDATOR] ${barcode} → L1:${layer1.found} L2:${layer2.found} L3:${layer3.found} → ${overallPass ? '✅ PASS' : '❌ FAIL'}`,
+      `[VALIDATOR] ${barcode} → found in incoming_data:${layer1.found ? '✅' : '❌'} | found in primary_sortings:${layer2.found ? '✅' : '❌'} | found in integration_logs:${layer3.found ? '✅' : '❌'} → ${overallPass ? '✅ PASS' : '❌ FAIL'}`,
       'VALIDATOR'
     );
 

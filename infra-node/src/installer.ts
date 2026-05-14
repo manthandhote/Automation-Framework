@@ -285,10 +285,24 @@ export class Installer {
       await execAsync(`${SUDO} chmod 777 /data/NIDOWORKZ`, { env: NO_PROMPT_ENV });
 
       if (await Installer.pathExists(backendDest)) {
-        onProgress('Backend repo exists — pulling latest...');
+        onProgress('Backend repo exists — safely pulling latest...');
+
+        // stash local env changes
+        await execAsync(
+          `git -C ${backendDest} stash push -- apps/incoming-service/.env || true`,
+          { env: NO_PROMPT_ENV, timeout: 30000 }
+        );
+
+        // pull latest
         await execAsync(
           `git -C ${backendDest} pull`,
           { env: NO_PROMPT_ENV, timeout: 120000 }
+        );
+
+        // restore env
+        await execAsync(
+          `git -C ${backendDest} stash pop || true`,
+          { env: NO_PROMPT_ENV, timeout: 30000 }
         );
       } else {
         onProgress(`Cloning backend (branch: ${backendBranch})...`);

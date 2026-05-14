@@ -192,7 +192,7 @@ export class TestRunner {
         executedAt: new Date(),
       });
 
-      onLog?.(`[TEST-RUNNER] ${result.passed ? '✅' : '❌'} ${tc.testId} → ${result.actualStatus}`);
+      onLog?.(`[TEST-RUNNER] ${result.passed ? '✅' : '❌'} ${tc.testId} → ${result.passed ? "passed" : "failed"}`);
       await this.sleep(800);
     }
 
@@ -334,7 +334,49 @@ export class TestRunner {
         uiResult = { found: false, error: uiErr.message, status: 'ERROR' };
       }
 
-      const actualStatus: 'PASS' | 'FAIL' = validation.overallPass ? 'PASS' : 'FAIL';
+      // ── Step 1: What actually happened? (PB response is the source of truth) ──
+      const rejectionCode = simulation?.rejectionCode
+        || simulation?.steps.find(s => s.type === 'PB')?.response?.match(/,([A-Z]{4})\s/)?.[1]
+        || null;
+
+      // PASS = parcel sorted successfully (no rejection code, overallPass true)
+      // FAIL = parcel was rejected (any rejection code present)
+      const actualStatus: 'PASS' | 'FAIL' = validation.overallPass && !rejectionCode ? 'PASS' : 'FAIL';
+      const passed = actualStatus === tc.expectedStatus;
+
+      // ── Step 2: Did the UI correctly reflect what actually happened? ──────────
+      // UI is correct if it shows the same outcome (rejection code or success) as the machine response.
+      // This is independent of whether the test passed or failed.
+      const uiRejectionCode = uiResult?.displayedRejectionCode || null;
+      const uiStatus = uiResult?.displayedStatus || null;
+
+      let uiCorrect: boolean | null = null;
+      let uiNote: string = '';
+
+      if (uiResult && uiResult.status !== 'ERROR' && uiResult.found) {
+        if (actualStatus === 'FAIL' && rejectionCode) {
+          // Machine rejected with a code — UI should show that same code
+          uiCorrect = uiRejectionCode === rejectionCode;
+          uiNote = uiCorrect
+            ? `UI correctly shows rejection "${rejectionCode}"`
+            : `UI shows "${uiRejectionCode}" but machine rejected with "${rejectionCode}"`;
+        } else if (actualStatus === 'PASS') {
+          // Machine sorted — UI should show a success/sorted status
+          uiCorrect = uiStatus !== 'Rejected';
+          uiNote = uiCorrect
+            ? `UI correctly shows success status`
+            : `UI shows "Rejected" but machine sorted successfully`;
+        }
+      } else if (uiResult && !uiResult.found) {
+        uiCorrect = false;
+        uiNote = `Barcode not found on UI dashboard`;
+      } else {
+        uiNote = `UI check skipped or errored`;
+      }
+
+      const reason = passed
+        ? `Expected ${tc.expectedStatus} → Got ${actualStatus} ✅${uiNote ? ' | UI: ' + uiNote : ''}`
+        : `Expected ${tc.expectedStatus} → Got ${actualStatus} ❌${rejectionCode ? ` (${rejectionCode})` : ''}${uiNote ? ' | UI: ' + uiNote : ''}`;
 
       return {
         testId: tc.testId,
@@ -343,12 +385,13 @@ export class TestRunner {
         machineName,
         expectedStatus: tc.expectedStatus,
         actualStatus,
-        passed: actualStatus === tc.expectedStatus,
+        passed,
         simulation,
         validation,
-        uiResult,
+        uiResult: { ...uiResult, uiCorrect, uiNote },
         durationMs: Date.now() - startTime,
         screenshotPath: uiResult?.screenshotPath,
+        reason,
       };
 
     } catch (err: any) {
