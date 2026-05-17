@@ -15,6 +15,21 @@ export interface ValidationStatus {
   };
 }
 
+// ── All known barcode field names across clients ──────────────────────────────
+// Meesho: awb
+// DHL:    hu_id
+// Generic: barcode, barcode_data.barcode
+const BARCODE_QUERY = (traceId: string) => ({
+  $or: [
+    { awb: traceId },
+    { hu_id: traceId },
+    { barcode: traceId },
+    { 'barcode_data.barcode': traceId },
+    { tracking_no: traceId },
+    { shipment_no: traceId },
+  ]
+});
+
 export class LifecycleValidator {
   private client: MongoClient;
 
@@ -33,9 +48,10 @@ export class LifecycleValidator {
   /**
    * Get the full lifecycle status of a parcel by tracing it through
    * all collections in the session-scoped database.
-   * 
-   * If dbName was provided, all lookups happen in that single DB.
-   * Otherwise, falls back to legacy multi-DB lookups.
+   *
+   * NOTE: This is TRACE DATA ONLY — it does not affect test pass/fail.
+   * Pass/fail is determined solely by comparing the TCP sort code response
+   * against tc.expectedSortCode in the test runner.
    */
   async getParcelStatus(traceId: string): Promise<ValidationStatus> {
     const status: ValidationStatus = {
@@ -58,9 +74,7 @@ export class LifecycleValidator {
         // 1. Check barcode/incoming data
         for (const name of ['incoming_data', 'incoming_packets', 'barcode_data']) {
           if (colNames.includes(name)) {
-            const doc = await db.collection(name).findOne({
-              $or: [{ awb: traceId }, { barcode: traceId }, { 'barcode_data.barcode': traceId }]
-            });
+            const doc = await db.collection(name).findOne(BARCODE_QUERY(traceId));
             if (doc) {
               status.manifested = true;
               status.details.barcodeData = doc;
@@ -72,9 +86,7 @@ export class LifecycleValidator {
         // 2. Check validation/sorting data
         for (const name of ['primary_sortings', 'sorting_results', 'validation_results']) {
           if (colNames.includes(name)) {
-            const doc = await db.collection(name).findOne({
-              $or: [{ awb: traceId }, { barcode: traceId }, { 'barcode_data.barcode': traceId }]
-            });
+            const doc = await db.collection(name).findOne(BARCODE_QUERY(traceId));
             if (doc) {
               status.scanned = true;
               status.validated = true;
@@ -90,6 +102,8 @@ export class LifecycleValidator {
             const doc = await db.collection(name).findOne({
               $or: [
                 { identifier: traceId },
+                { awb: traceId },
+                { hu_id: traceId },
                 { barcode: traceId },
                 { awb_number: traceId },
                 { upload_status: 'SUCCESS', barcode: traceId }
@@ -105,26 +119,34 @@ export class LifecycleValidator {
       } else {
         // ─── Legacy mode: multi-DB lookups ─────────────────────────────
         const incomingDb = this.client.db('incoming_service');
-        const manifest = await incomingDb.collection('incoming_data').findOne({
-          $or: [{ awb: traceId }, { barcode: traceId }]
-        });
+        const manifest = await incomingDb
+          .collection('incoming_data')
+          .findOne(BARCODE_QUERY(traceId));
         if (manifest) status.manifested = true;
 
-        const primaryDb = this.client.db('validation_engine');
-        const sorting = await primaryDb.collection('primary_sortings').findOne({
-          $or: [{ awb: traceId }, { barcode: traceId }]
-        });
+        const primaryDb = this.client.db('sorting_service');
+        const sorting = await primaryDb
+          .collection('primary_sortings')
+          .findOne(BARCODE_QUERY(traceId));
         if (sorting) {
           status.scanned = true;
           status.validated = true;
+          status.details.sortingData = sorting;
         }
 
-        const logDb = this.client.db('uploader');
+        const logDb = this.client.db('data_uploader_service');
         const log = await logDb.collection('integration_logs').findOne({
-          identifier: traceId,
-          upload_status: 'SUCCESS'
+          $or: [
+            { identifier: traceId },
+            { awb: traceId },
+            { hu_id: traceId },
+            { barcode: traceId },
+          ]
         });
-        if (log) status.pushed = true;
+        if (log) {
+          status.pushed = true;
+          status.details.integrationData = log;
+        }
       }
     } catch (err: any) {
       status.error = err.message;

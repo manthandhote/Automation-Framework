@@ -11,7 +11,7 @@ import { SessionHistory } from './components/SessionHistory';
 import { ExecutionReport } from './components/ExecutionReport';
 import './index.css';
 
-const API_BASE = 'http://localhost:4200';
+const API_BASE = `http://localhost:4200`;
 
 const App = () => {
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -37,11 +37,11 @@ const App = () => {
         setHealth(data.health);
         const map: Record<string, string> = {};
         data.health.forEach((h: any) => {
-           // Only update if the backend reports UP, or if we don't have a status yet
-           // This prevents the static 'DOWN' from the backend from overwriting our inferred 'UP'
-           if (h.status === 'UP' || !serviceStatusMap[h.name]) {
-             map[h.name] = h.status;
-           }
+          // Only update if the backend reports UP, or if we don't have a status yet
+          // This prevents the static 'DOWN' from the backend from overwriting our inferred 'UP'
+          if (h.status === 'UP' || !serviceStatusMap[h.name]) {
+            map[h.name] = h.status;
+          }
         });
         setServiceStatusMap(prev => ({ ...prev, ...map }));
       }
@@ -64,14 +64,14 @@ const App = () => {
 
     socket.on('simulator:packet', (log) => {
       setLogs(prev => [log, ...prev].slice(0, 100));
-      
+
       // Smart Health: Parse logs for any service activity
       // If a service emits a log, it is definitely UP
       const serviceMatch = log.data.match(/\[(.*?)\]/);
       if (serviceMatch && serviceMatch[1]) {
         const serviceName = serviceMatch[1].toLowerCase();
         // Check if this matches any of our services (with or without -service suffix)
-        const targetService = Object.keys(serviceStatusMap).find(s => 
+        const targetService = Object.keys(serviceStatusMap).find(s =>
           s.toLowerCase() === serviceName || s.toLowerCase().replace('-service', '') === serviceName
         );
         if (targetService) {
@@ -84,15 +84,15 @@ const App = () => {
         const parts = log.data.split(' ');
         const serviceName = parts[1];
         if (serviceName) {
-           setServiceStatusMap(prev => ({ ...prev, [serviceName]: 'UP' }));
+          setServiceStatusMap(prev => ({ ...prev, [serviceName]: 'UP' }));
         }
       }
-      
+
       if (log.data.includes('[spawn]') && log.data.includes('-> FAILED')) {
         const parts = log.data.split(' ');
         const serviceName = parts[1];
         if (serviceName) {
-           setServiceStatusMap(prev => ({ ...prev, [serviceName]: 'DOWN' }));
+          setServiceStatusMap(prev => ({ ...prev, [serviceName]: 'DOWN' }));
         }
       }
     });
@@ -128,17 +128,17 @@ const App = () => {
       <div className={`sidebar ${isSidebarCollapsed ? 'collapsed' : ''}`}>
         <div style={{ marginBottom: '3rem', padding: '0 0.5rem' }}>
           <div className="logo-group" style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-             <div className="logo-icon-container" style={{ 
-               width: '40px', height: '40px', background: 'var(--primary-glow)', borderRadius: '10px',
-               display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 15px rgba(0, 242, 255, 0.4)'
-             }}>
-                <Zap size={24} color="#000" />
-             </div>
-             {!isSidebarCollapsed && (
-               <div style={{ fontSize: '1.25rem', fontWeight: 800, letterSpacing: '0.5px', color: '#fff' }}>
-                 AUTO<span style={{ color: 'var(--primary-glow)' }}>MYRIX</span>
-               </div>
-             )}
+            <div className="logo-icon-container" style={{
+              width: '40px', height: '40px', background: 'var(--primary-glow)', borderRadius: '10px',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 15px rgba(0, 242, 255, 0.4)'
+            }}>
+              <Zap size={24} color="#000" />
+            </div>
+            {!isSidebarCollapsed && (
+              <div style={{ fontSize: '1.25rem', fontWeight: 800, letterSpacing: '0.5px', color: '#fff' }}>
+                AUTO<span style={{ color: 'var(--primary-glow)' }}>MYRIX</span>
+              </div>
+            )}
           </div>
         </div>
 
@@ -165,9 +165,9 @@ const App = () => {
           </div>
         </nav>
 
-        <button 
+        <button
           onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
-          style={{ 
+          style={{
             background: 'rgba(255,255,255,0.05)', border: '1px solid var(--glass-border)', color: '#fff',
             padding: '0.5rem', borderRadius: '8px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center'
           }}
@@ -204,7 +204,7 @@ const App = () => {
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
                   <div className="metric-label">Microservices Health</div>
                   <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                    <button 
+                    <button
                       onClick={() => {
                         setServiceStatusMap(prev => {
                           const newMap = { ...prev };
@@ -274,31 +274,31 @@ const App = () => {
                   </div>
                 </div>
                 <div style={{ height: '60px', background: 'linear-gradient(90deg, transparent, rgba(0,242,255,0.1), transparent)', borderRadius: '8px', marginTop: '1rem', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                   <Activity size={32} color="var(--primary-glow)" opacity={0.3} />
+                  <Activity size={32} color="var(--primary-glow)" opacity={0.3} />
                 </div>
               </div>
             </div>
-            
+
             <div className="glass-card" style={{ background: 'linear-gradient(135deg, rgba(0,242,255,0.05) 0%, rgba(112,0,255,0.05) 100%)' }}>
-               <h3 style={{ marginBottom: '1rem' }}>Active Session Overview</h3>
-               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '2rem' }}>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginBottom: '4px' }}>CURRENT LOAD</div>
-                    <div style={{ fontSize: '1.25rem', fontWeight: 700 }}>1,250 PPH</div>
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginBottom: '4px' }}>ACTIVE MACHINES</div>
-                    <div style={{ fontSize: '1.25rem', fontWeight: 700 }}>5 Nodes</div>
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginBottom: '4px' }}>RESOURCE USAGE</div>
-                    <div style={{ fontSize: '1.25rem', fontWeight: 700 }}>42% CPU</div>
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginBottom: '4px' }}>LATENCY TREND</div>
-                    <div style={{ fontSize: '1.25rem', fontWeight: 700, color: 'var(--accent-green)' }}>STABLE</div>
-                  </div>
-               </div>
+              <h3 style={{ marginBottom: '1rem' }}>Active Session Overview</h3>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '2rem' }}>
+                <div>
+                  <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginBottom: '4px' }}>CURRENT LOAD</div>
+                  <div style={{ fontSize: '1.25rem', fontWeight: 700 }}>1,250 PPH</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginBottom: '4px' }}>ACTIVE MACHINES</div>
+                  <div style={{ fontSize: '1.25rem', fontWeight: 700 }}>5 Nodes</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginBottom: '4px' }}>RESOURCE USAGE</div>
+                  <div style={{ fontSize: '1.25rem', fontWeight: 700 }}>42% CPU</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginBottom: '4px' }}>LATENCY TREND</div>
+                  <div style={{ fontSize: '1.25rem', fontWeight: 700, color: 'var(--accent-green)' }}>STABLE</div>
+                </div>
+              </div>
             </div>
           </div>
         )}
@@ -329,19 +329,19 @@ const App = () => {
               <div style={{ fontWeight: 'bold', fontSize: '0.8rem', color: 'var(--primary-glow)', letterSpacing: '1px' }}>PIPELINE INJECTOR</div>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '1.5rem' }}>
                 <button onClick={() => runSimulation('normal')} className="glass-card" style={{ padding: '1.25rem', cursor: 'pointer', border: '1px solid rgba(0,242,255,0.1)', textAlign: 'center' }}>
-                  <Cpu size={20} style={{ display: 'block', margin: '0 auto 0.75rem', color: 'var(--primary-glow)' }} /> 
+                  <Cpu size={20} style={{ display: 'block', margin: '0 auto 0.75rem', color: 'var(--primary-glow)' }} />
                   <div style={{ fontSize: '0.8rem', fontWeight: 600 }}>Hardware Simulation</div>
                 </button>
                 <button onClick={() => pulsePipeline('incoming')} className="glass-card" style={{ padding: '1.25rem', cursor: 'pointer', border: '1px solid rgba(112,0,255,0.1)', textAlign: 'center' }}>
-                  <Database size={20} style={{ display: 'block', margin: '0 auto 0.75rem', color: 'var(--secondary-glow)' }} /> 
+                  <Database size={20} style={{ display: 'block', margin: '0 auto 0.75rem', color: 'var(--secondary-glow)' }} />
                   <div style={{ fontSize: '0.8rem', fontWeight: 600 }}>Incoming Stream</div>
                 </button>
                 <button onClick={() => pulsePipeline('mapper')} className="glass-card" style={{ padding: '1.25rem', cursor: 'pointer', border: '1px solid rgba(0,255,136,0.1)', textAlign: 'center' }}>
-                  <Zap size={20} style={{ display: 'block', margin: '0 auto 0.75rem', color: 'var(--accent-green)' }} /> 
+                  <Zap size={20} style={{ display: 'block', margin: '0 auto 0.75rem', color: 'var(--accent-green)' }} />
                   <div style={{ fontSize: '0.8rem', fontWeight: 600 }}>Mapper Logic</div>
                 </button>
                 <button onClick={() => pulsePipeline('posting')} className="glass-card" style={{ padding: '1.25rem', cursor: 'pointer', border: '1px solid rgba(255,0,85,0.1)', textAlign: 'center' }}>
-                  <Send size={20} style={{ display: 'block', margin: '0 auto 0.75rem', color: 'var(--accent-pink)' }} /> 
+                  <Send size={20} style={{ display: 'block', margin: '0 auto 0.75rem', color: 'var(--accent-pink)' }} />
                   <div style={{ fontSize: '0.8rem', fontWeight: 600 }}>Data Posting</div>
                 </button>
               </div>
@@ -351,8 +351,8 @@ const App = () => {
               <div style={{ flex: 1, padding: '1.25rem', overflowY: 'auto', fontFamily: '"JetBrains Mono", monospace' }}>
                 {logs.length === 0 && <div style={{ color: '#334155', fontSize: '0.9rem' }}>Waiting for system events...</div>}
                 {logs.map((log, i) => (
-                  <div key={i} style={{ 
-                    color: log.data.includes('ERROR') ? 'var(--accent-pink)' : log.data.includes('VALIDATION') ? 'var(--secondary-glow)' : '#94a3b8', 
+                  <div key={i} style={{
+                    color: log.data.includes('ERROR') ? 'var(--accent-pink)' : log.data.includes('VALIDATION') ? 'var(--secondary-glow)' : '#94a3b8',
                     marginBottom: '6px', fontSize: '0.85rem', borderLeft: '2px solid transparent', paddingLeft: '8px'
                   }}>
                     <span style={{ color: '#475569', fontSize: '0.75rem' }}>{new Date(log.timestamp).toLocaleTimeString()}</span>

@@ -29,12 +29,32 @@ const L2_COLLECTION = 'primary_sortings';
 const L3_DB = 'data_uploader_service';
 const L3_COLLECTION = 'integration_logs';
 
+// ─── Dynamic barcode query ─────────────────────────────────────────────────────
+//
+// Different clients store the barcode under different field names:
+//   Meesho → awb
+//   DHL    → hu_id
+//   Others → barcode, tracking_no, shipment_no, parcel_id, consignment_id
+//
+// Using $or across all known field names means this works for any client
+// without requiring any per-client configuration here.
+
+const barcodeQuery = (barcode: string) => ({
+  $or: [
+    { awb: barcode },
+    { hu_id: barcode },
+    { barcode: barcode },
+    { tracking_no: barcode },
+    { shipment_no: barcode },
+    { parcel_id: barcode },
+    { consignment_id: barcode },
+  ]
+});
+
 export class BackendValidator {
   private mongoUri: string;
 
   constructor(mongoUri: string, _sessionDbName?: string) {
-    // _sessionDbName kept for API compatibility but is no longer used for queries.
-    // Each layer now targets its own dedicated database.
     this.mongoUri = mongoUri;
   }
 
@@ -61,8 +81,9 @@ export class BackendValidator {
       retries, retryDelayMs, 'Layer3-Integration'
     );
 
+    // overallPass is trace info only — does NOT affect test pass/fail.
+    // Test pass/fail is determined by expectedSortCode vs actualSortCode in test-runner.
     const overallPass = layer1.found && layer2.found;
-    // Layer 3 is best-effort — not all flows upload
 
     logger.info(
       `[VALIDATOR] ${barcode} → found in incoming_data:${layer1.found ? '✅' : '❌'} | found in primary_sortings:${layer2.found ? '✅' : '❌'} | found in integration_logs:${layer3.found ? '✅' : '❌'} → ${overallPass ? '✅ PASS' : '❌ FAIL'}`,
@@ -82,21 +103,17 @@ export class BackendValidator {
   // ─── Layer 1: Ingestion ───────────────────────────────────────────────────
   // DB:  incoming_service
   // Col: incoming_data
-  // Key: awb  (no top-level barcode field in this collection)
+  // Key: dynamic — awb (Meesho), hu_id (DHL), barcode, tracking_no, etc.
   private async checkLayer1(barcode: string): Promise<LayerResult> {
     const start = Date.now();
     try {
-      const result = await this.findInDb(
-        L1_DB,
-        L1_COLLECTION,
-        { awb: barcode }
-      );
+      const result = await this.findInDb(L1_DB, L1_COLLECTION, barcodeQuery(barcode));
       return {
         layer: 'Layer1-Ingestion',
         collection: L1_COLLECTION,
         found: !!result,
         data: result ?? undefined,
-        error: result ? undefined : 'AWB not found in incoming_data',
+        error: result ? undefined : 'Barcode not found in incoming_data',
         durationMs: Date.now() - start
       };
     } catch (e: any) {
@@ -113,15 +130,10 @@ export class BackendValidator {
   // ─── Layer 2: Sorting ─────────────────────────────────────────────────────
   // DB:  sorting_service
   // Col: primary_sortings
-  // Key: barcode (primary) | awb (fallback — same value, belt-and-suspenders)
   private async checkLayer2(barcode: string): Promise<LayerResult> {
     const start = Date.now();
     try {
-      const result = await this.findInDb(
-        L2_DB,
-        L2_COLLECTION,
-        { $or: [{ barcode }, { awb: barcode }] }
-      );
+      const result = await this.findInDb(L2_DB, L2_COLLECTION, barcodeQuery(barcode));
       return {
         layer: 'Layer2-Sorting',
         collection: L2_COLLECTION,
@@ -144,21 +156,26 @@ export class BackendValidator {
   // ─── Layer 3: Integration / Upload ────────────────────────────────────────
   // DB:  data_uploader_service
   // Col: integration_logs
-  // Key: request.body.waybill_no  (barcode is nested — NOT a top-level field)
+  // Key: nested waybill_no + all flat barcode fields
   private async checkLayer3(barcode: string): Promise<LayerResult> {
     const start = Date.now();
     try {
       const result = await this.findInDb(
         L3_DB,
         L3_COLLECTION,
-        { 'request.body.waybill_no': barcode }
+        {
+          $or: [
+            { 'request.body.waybill_no': barcode },
+            ...barcodeQuery(barcode).$or,   // spread all flat field checks
+          ]
+        }
       );
       return {
         layer: 'Layer3-Integration',
         collection: L3_COLLECTION,
         found: !!result,
         data: result ?? undefined,
-        error: result ? undefined : 'Waybill not found in integration_logs (may not have uploaded yet)',
+        error: result ? undefined : 'Barcode not found in integration_logs (may not have uploaded yet)',
         durationMs: Date.now() - start
       };
     } catch (e: any) {
@@ -172,15 +189,12 @@ export class BackendValidator {
     }
   }
 
-  // ─── DB helper ───────────────────────────────────────────────────────────
-  // Now accepts explicit dbName + collection + query per call.
-  // No more shared this.dbName across all layers.
+  // ─── DB helper ────────────────────────────────────────────────────────────
   private async findInDb(dbName: string, collection: string, query: object): Promise<any | null> {
     const client = new MongoClient(this.mongoUri);
     try {
       await client.connect();
-      const result = await client.db(dbName).collection(collection).findOne(query);
-      return result;
+      return await client.db(dbName).collection(collection).findOne(query);
     } finally {
       await client.close();
     }
@@ -201,7 +215,7 @@ export class BackendValidator {
         await new Promise(r => setTimeout(r, delayMs));
       }
     }
-    return fn(); // final attempt
+    return fn();
   }
 
   // ─── Get full parcel status (used by /api/validate endpoint) ─────────────

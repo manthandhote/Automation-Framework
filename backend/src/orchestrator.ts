@@ -6,6 +6,7 @@ import { CodeSummary } from './core/code-analyzer';
 import { DbAnalyzer, DbSummary } from './core/db-analyzer';
 import { TestRunner } from './backend-tests/test-runner';
 import { E2ETestRunner, E2EReport } from './backend-tests/platform/e2e-test-runner';
+import { IncomingDataSeeder } from './core/incoming-data-seeder';  // ← NEW
 import { MongoClient } from 'mongodb';
 import { exec, ChildProcess } from 'child_process';
 import util from 'util';
@@ -127,8 +128,8 @@ export class Orchestrator {
     feRepo: string;
     feBranch: string;
     codeDir?: string;
-    dbRepoUrl?: string;        // NEW: GitHub DB reference repo URL
-    dbClientFolder?: string;   // NEW: selected client folder, e.g. "meesho/astro"
+    dbRepoUrl?: string;
+    dbClientFolder?: string;
     testFilePath?: string;
   }, onLog: (msg: string) => void, onProgress?: (step: string, percent: number) => void) {
 
@@ -146,8 +147,8 @@ export class Orchestrator {
         feRepo: config.feRepo,
         feBranch: config.feBranch,
         codeDir: config.codeDir || this.workspacePath,
-        dbRepoUrl: config.dbRepoUrl,           // persisted for rerun
-        dbClientFolder: config.dbClientFolder, // persisted for rerun
+        dbRepoUrl: config.dbRepoUrl,
+        dbClientFolder: config.dbClientFolder,
         machineIds: config.machineIds,
         status: 'RUNNING',
         startedAt: new Date()
@@ -196,17 +197,6 @@ export class Orchestrator {
       await this.inspectraDb.updateSession(config.sessionId, { beCommit, feCommit });
 
       // ── STEP 3: DB restore via GitHub repo → VM ──────────────────────────
-      //
-      // Flow:
-      //   1. Orchestrator tells infra-node: clone this GitHub repo + restore the
-      //      collections/<db>.<collection>.json files for the selected client.
-      //   2. Infra-node runs `mongoimport` per file on the VM's local MongoDB.
-      //   3. DbAnalyzer connects to the VM MongoDB and reads machine configs.
-      //
-      // DB name convention is embedded in the filename:
-      //   incoming_service.incoming_data.json  → db=incoming_service, col=incoming_data
-      //   sorting_service.primary_sortings.json → db=sorting_service,  col=primary_sortings
-      //
       const restoredDbName = 'inspectra_csnd';
       let dbSummary: DbSummary | null = null;
 
@@ -228,6 +218,45 @@ export class Orchestrator {
           dbSummary = { ...dbSummary, machines: targetMachines, totalMachines: targetMachines.length };
           onLog(`[ORCHESTRATOR] Filtered to ${targetMachines.length} target machines.`);
         }
+      }
+
+      // ── STEP 3.5: Seed incoming data via HTTP → VM incoming-service ───────
+      //
+      // Flow:
+      //   1. Clear incoming_service.incoming_data on VM MongoDB.
+      //   2. Read push config from incoming_service.incoming_config
+      //      (ids referenced by machine.incoming_data_config).
+      //   3. Read incoming-service port from machine.machine_services_config.
+      //   4. Load test data from control-machine disk: test-data/incoming-test.json
+      //      using key = clientName.toLowerCase() + "_incoming".
+      //   5. Build payload per record using mapping rules (Direct/GUID/Static/Now).
+      //   6. POST each AWB to http://{vmIp}:{port}{endpoint}.
+      //   7. First successfully pushed AWB becomes validAwb for SUCC + DUPR tests.
+
+      let pushedAwbs: string[] = [];
+
+      if (dbSummary && dbSummary.machines.length > 0) {
+        onLog(`[SEEDER] Starting incoming data seed for client: ${config.clientName}`);
+        onProgress?.('Seeding Incoming Data', 35);
+
+        // Use the first target machine (or the selected one if machineIds provided)
+        const seedMachine = dbSummary.machines[0];
+
+        try {
+          const seeder = new IncomingDataSeeder(this.testDbUri, this.vmIp, this.workspacePath);
+          const seedResult = await seeder.seed(config.clientName, seedMachine.id, onLog);
+          pushedAwbs = seedResult.pushed;
+
+          if (pushedAwbs.length === 0) {
+            onLog(`[WARNING] No AWBs were pushed to incoming-service — SUCC/DUPR tests will fallback to DB lookup`);
+          } else {
+            onLog(`[SEEDER] ✅ ${pushedAwbs.length} AWBs seeded. validAwb for tests: ${seedResult.validAwb}`);
+          }
+        } catch (e: any) {
+          onLog(`[WARNING] Incoming data seeding failed: ${e.message} — test builder will fallback to DB lookup`);
+        }
+      } else {
+        onLog(`[WARNING] No machines found — skipping incoming data seed`);
       }
 
       // ── STEP 4: LLM Analysis ─────────────────────────────────────────────
@@ -260,7 +289,13 @@ export class Orchestrator {
       // ── STEP 5: Generate test cases ──────────────────────────────────────
       onLog(`[AI] Generating test cases...`);
       onProgress?.('Generating Tests', 70);
-      const testCases = await this.generateSessionTestCases(config.sessionId, codeSummary, restoredDbName, dbSummary);
+
+      // Pass pushedAwbs so TestCaseBuilder uses them for SUCC/DUPR
+      // instead of doing a fresh DB lookup (which would find the same
+      // AWBs we just pushed, but this is explicit and avoids latency).
+      const testCases = await this.generateSessionTestCases(
+        config.sessionId, codeSummary, restoredDbName, dbSummary, pushedAwbs
+      );
       onLog(`[ORCHESTRATOR] Generated ${testCases.length} test cases.`);
 
       await this.inspectraDb.updateSession(config.sessionId, { status: 'COMPLETED' });
@@ -275,14 +310,30 @@ export class Orchestrator {
     return { status: 'PROVISIONED', sessionId: config.sessionId };
   }
 
-  async generateSessionTestCases(sessionId: string, providedCodeSummary: CodeSummary, restoredDbName: string, providedSummary?: DbSummary): Promise<any[]> {
+  // ── generateSessionTestCases ───────────────────────────────────────────────
+  //
+  // pushedAwbs: AWBs successfully seeded via IncomingDataSeeder.
+  //   If provided and non-empty, TestCaseBuilder skips its DB lookup
+  //   and uses pushedAwbs[0] as the validAwb for SUCC + DUPR scenarios.
+  //   DNFR and IBAR cases are unaffected.
+
+  async generateSessionTestCases(
+    sessionId: string,
+    providedCodeSummary: CodeSummary,
+    restoredDbName: string,
+    providedSummary?: DbSummary,
+    pushedAwbs: string[] = []          // ← NEW param
+  ): Promise<any[]> {
     let dbSummary = providedSummary;
     if (!dbSummary) {
       const dbAnalyzer = new DbAnalyzer(this.testDbUri, restoredDbName);
       dbSummary = await dbAnalyzer.analyze();
     }
     const builder = new TestCaseBuilder(this.testDbUri, restoredDbName);
-    const testCases = await builder.buildWithLlm(dbSummary, providedCodeSummary);
+
+    // Pass pushedAwbs to builder — it will use them for SUCC/DUPR
+    const testCases = await builder.buildWithLlm(dbSummary, providedCodeSummary, pushedAwbs);
+
     const casesWithMeta = testCases.map((tc, i) => ({
       ...tc,
       testId: tc.testId || `TC-${String(i + 1).padStart(3, '0')}`,
@@ -363,7 +414,7 @@ export class Orchestrator {
       await this.inspectraDb.updateSession(sessionId, { status: 'RUNNING', startedAt: new Date() });
       const dbName = session.restoredDbName || 'inspectra_csnd';
 
-      // Re-restore DB from GitHub repo if the session has that info
+      // Re-restore DB from GitHub repo
       if (session.dbRepoUrl && session.dbClientFolder) {
         onLog(`[ORCHESTRATOR] Re-restoring DB from GitHub repo on VM...`);
         const token = process.env.GITHUB_TOKEN;
@@ -379,6 +430,24 @@ export class Orchestrator {
       const dbAnalyzer = new DbAnalyzer(this.testDbUri, dbName);
       const dbSummary = await dbAnalyzer.analyze();
 
+      // ── Re-seed incoming data ──────────────────────────────────────────
+      let pushedAwbs: string[] = [];
+
+      if (dbSummary.machines.length > 0 && session.clientName) {
+        onLog(`[SEEDER] Re-seeding incoming data for rerun...`);
+        const seedMachine = dbSummary.machines[0];
+
+        try {
+          const seeder = new IncomingDataSeeder(this.testDbUri, this.vmIp, this.workspacePath);
+          const seedResult = await seeder.seed(session.clientName, seedMachine.id, onLog);
+          pushedAwbs = seedResult.pushed;
+          onLog(`[SEEDER] ✅ Rerun seed complete: ${pushedAwbs.length} AWBs. validAwb: ${seedResult.validAwb}`);
+          onLog(`Push Configurations are Working fine ========>${pushedAwbs}`)
+        } catch (e: any) {
+          onLog(`[WARNING] Rerun seed failed: ${e.message} — falling back to DB lookup`);
+        }
+      }
+
       let codeSummary: CodeSummary;
       try {
         const analyzeResult = await emitToInfraWithAck('infra:analyze-code', { bePath: '/data/NIDOWORKZ/CSND' }, 60000);
@@ -388,7 +457,9 @@ export class Orchestrator {
         codeSummary = { totalServices: 0, services: [], sharedLibs: [], techStack: ['TypeScript', 'Node.js', 'Express', 'MongoDB'], framework: 'npm workspaces monorepo' };
       }
 
-      const testCases = await this.generateSessionTestCases(sessionId, codeSummary, dbName, dbSummary);
+      // Pass pushedAwbs to test case generator
+      const testCases = await this.generateSessionTestCases(sessionId, codeSummary, dbName, dbSummary, pushedAwbs);
+
       const selectedMachine = dbSummary.machines.find(m => (m as any).machine_key && m.name?.toLowerCase().includes('astro'))
         || dbSummary.machines.find(m => m.type?.toLowerCase() === 'astro')
         || dbSummary.machines[0];
@@ -403,10 +474,6 @@ export class Orchestrator {
     }
   }
 
-  // ── analyzeDiscoveredMachines ──────────────────────────────────────────────
-  // Called from /api/analyze-db during the setup chat to populate the
-  // machine picker. Restores the selected client's collections on the VM
-  // then reads the machine list from inspectra_csnd.
   async analyzeDiscoveredMachines(dbRepoUrl: string, dbClientFolder: string) {
     const restoredDbName = 'inspectra_csnd';
     try {
@@ -435,7 +502,19 @@ export class Orchestrator {
       onLog(`[ORCHESTRATOR] Clearing primary_sortings...`);
       await sortingdb.collection('primary_sortings').deleteMany({});
 
-      const uploaderdb = client.db('data_uploader_service')
+      const incomingdb = client.db('incoming_service');
+      onLog(`[ORCHESTRATOR] Updating incoming_config base URLs...`);
+      await incomingdb.collection('incoming_config').updateMany(
+        {},
+        {
+          $set: {
+            "api_details.base_url": "https://nido.com",
+            "api_details.authentication_details.base_url": "https://nido.com"
+          }
+        }
+      );
+
+      const uploaderdb = client.db('data_uploader_service');
       onLog(`[ORCHESTRATOR] Updating Data posting URL...`);
       await uploaderdb.collection('integration_config').updateMany({}, {
         $set: {
@@ -444,37 +523,17 @@ export class Orchestrator {
         }
       });
 
-
+      const baggingdb = client.db('bagging');
       onLog(`[ORCHESTRATOR] Resetting active_bags...`);
-      await sortingdb.collection('active_bags').updateMany({}, {
+      await baggingdb.collection('active_bags').updateMany({}, {
         $set: {
           items: [],
           rejected_items: [],
           delinked_items: [],
-
-          "count_data.allocated": 0,
-          "count_data.scanned": 0,
-          "count_data.balance": 0,
-          "count_data.free": 0,
-          "count_data.occupancy": 0,
-
-          "weight_data.allocated": 0,
-          "weight_data.scanned": 0,
-          "weight_data.balance": 0,
-          "weight_data.free": 0,
-          "weight_data.occupancy": 0,
-
-          "volume_data.allocated": 0,
-          "volume_data.scanned": 0,
-          "volume_data.balance": 0,
-          "volume_data.free": 0,
-          "volume_data.occupancy": 0,
-
-          "volume_weight_data.allocated": 0,
-          "volume_weight_data.scanned": 0,
-          "volume_weight_data.balance": 0,
-          "volume_weight_data.free": 0,
-          "volume_weight_data.occupancy": 0
+          "count_data.allocated": 0, "count_data.scanned": 0, "count_data.balance": 0, "count_data.free": 0, "count_data.occupancy": 0,
+          "weight_data.allocated": 0, "weight_data.scanned": 0, "weight_data.balance": 0, "weight_data.free": 0, "weight_data.occupancy": 0,
+          "volume_data.allocated": 0, "volume_data.scanned": 0, "volume_data.balance": 0, "volume_data.free": 0, "volume_data.occupancy": 0,
+          "volume_weight_data.allocated": 0, "volume_weight_data.scanned": 0, "volume_weight_data.balance": 0, "volume_weight_data.free": 0, "volume_weight_data.occupancy": 0
         }
       });
       onLog(`[ORCHESTRATOR] Database cleanup complete.`);

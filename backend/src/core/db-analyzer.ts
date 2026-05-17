@@ -46,59 +46,6 @@ export class DbAnalyzer {
     this.restoredDbName = restoredDbName;
   }
 
-  public async mergeAllIntoSessionDb(): Promise<void> {
-    // ── BYPASSED ──────────────────────────────────────────────────────────────
-    // Services now use their original databases as defined in each service's
-    // .env file. No session-specific DB merging is needed.
-    //
-    // To re-enable session isolation, remove the early return below and restore
-    // the original merge logic that follows it.
-    // ─────────────────────────────────────────────────────────────────────────
-    logger.info('[MERGE] mergeAllIntoSessionDb is bypassed — using original DBs', 'DB-ANALYZER');
-    return;
-
-    /* ── ORIGINAL MERGE LOGIC (kept for reference / re-enable) ──────────────
-    const client = new MongoClient(this.mongoUri);
-    const skipDbs = ['admin', 'local', 'config', 'inspectra_meta'];
- 
-    try {
-      await client.connect();
-      const admin = client.db().admin();
-      const dbList = await admin.listDatabases();
-      const targetDb = client.db(this.restoredDbName);
- 
-      for (const dbInfo of dbList.databases) {
-        if (skipDbs.includes(dbInfo.name)) continue;
-        if (dbInfo.name === this.restoredDbName) continue;
-        if (dbInfo.name.startsWith('inspectra_csnd_')) continue;
-        if (dbInfo.name.startsWith('temp_analysis_')) continue;
- 
-        const sourceDb = client.db(dbInfo.name);
-        const collections = await sourceDb.listCollections().toArray();
- 
-        for (const col of collections) {
-          const data = await sourceDb.collection(col.name).find().toArray();
-          if (data.length === 0) continue;
- 
-          try {
-            await targetDb.collection(col.name).insertMany(data, { ordered: false });
-            logger.info(`[MERGE] ${dbInfo.name}.${col.name} → ${this.restoredDbName}.${col.name} (${data.length} docs)`, 'DB-ANALYZER');
-          } catch (err: any) {
-            if (err.code === 11000 || err.name === 'MongoBulkWriteError') {
-              logger.warn(`[MERGE] Duplicates skipped in ${col.name}`, 'DB-ANALYZER');
-            } else {
-              throw err;
-            }
-          }
-        }
-      }
- 
-      logger.info(`[MERGE] All data merged into ${this.restoredDbName}`, 'DB-ANALYZER');
-    } finally {
-      await client.close();
-    }
-    ── END ORIGINAL MERGE LOGIC ─────────────────────────────────────────── */
-  }
 
   async analyze(): Promise<DbSummary> {
     logger.info(`Analyzing databases (machines: machine_configurations, configs: ${this.restoredDbName})...`, 'DB-ANALYZER');

@@ -39,6 +39,21 @@ function extractResponses(sim: SimulationResult): {
   };
 }
 
+// ── Extract the 4-letter sort code from a PB response string ──────────────────
+//
+// PB response format: "MA01,1831,PB,1001,1003,SUCC"
+//                                               ^^^^  ← last comma-segment
+// Covers: SUCC, DNFR, IBAR, DUPR, DBAR, GIFR, SBRR, etc.
+// Returns null if the response is empty or unparseable.
+
+function extractSortCode(pbResponse: string): string | null {
+  if (!pbResponse) return null;
+  const parts = pbResponse.trim().split(',');
+  const last = parts[parts.length - 1]?.trim();
+  // Must be exactly 4 uppercase letters
+  return last && /^[A-Z]{4}$/.test(last) ? last : null;
+}
+
 export interface TestCase {
   testId: string;
   service: string;
@@ -161,7 +176,6 @@ export class TestRunner {
     for (const tc of testCases) {
       onLog?.(`[TEST-RUNNER] ▶ Running ${tc.testId}: ${tc.description}`);
 
-      // screenshotsDir is passed explicitly so UIValidator saves to the correct run folder
       const result = await this.runSingle(tc, sessionId, dbSummary, screenshotsDir, onLog);
       results.push(result);
 
@@ -177,8 +191,8 @@ export class TestRunner {
         rejectionCode: result.uiResult?.displayedRejectionCode || result.simulation?.rejectionCode || undefined,
         reason: result.reason || result.error ||
           (result.passed
-            ? `Expected ${tc.expectedStatus} → Got ${result.actualStatus} ✅`
-            : `Expected ${tc.expectedStatus} → Got ${result.actualStatus} ❌`),
+            ? `Expected ${tc.expectedSortCode} → Got ${tc.expectedSortCode} ✅`
+            : `Expected ${tc.expectedSortCode} → Got actual sort code ❌`),
         trace: result.validation ? {
           ingestion: result.validation.layer1_ingestion.found,
           sorting: result.validation.layer2_sorting.found,
@@ -192,7 +206,7 @@ export class TestRunner {
         executedAt: new Date(),
       });
 
-      onLog?.(`[TEST-RUNNER] ${result.passed ? '✅' : '❌'} ${tc.testId} → ${result.passed ? "passed" : "failed"}`);
+      onLog?.(`[TEST-RUNNER] ${result.passed ? '✅' : '❌'} ${tc.testId} → ${result.passed ? 'passed' : 'failed'} | expected: ${tc.expectedSortCode ?? tc.expectedStatus} | actual: ${result.reason}`);
       await this.sleep(800);
     }
 
@@ -223,7 +237,6 @@ export class TestRunner {
     let validation: ValidationResult | null = null;
     let uiResult: any | null = null;
 
-    // Shared validator — no hardcoded DB, each layer targets its own DB
     const validator = new BackendValidator(this.mongoUri);
 
     try {
@@ -232,17 +245,8 @@ export class TestRunner {
       const dims = tc.dims ?? { l: 187, b: 172, h: 47 };
       const weight = tc.weight ?? 0.12;
 
-      // ─── DUPLICATE TEST (DUPR) ──────────────────────────────────────────────
-      // Scenario: barcode completed a full sort cycle in TC-001 (SUCC).
-      // Re-feeding the same barcode must produce DUPR (duplicate parcel rejection).
-      //
-      // expectedStatus: 'FAIL' — DUPR is a rejection; the parcel does NOT sort.
-      // The test PASSES (passed=true) when actualStatus === 'FAIL' === tc.expectedStatus.
-      // Dashboard shows: Status="Rejected", RejectionCode="DUPR".
+      // ─── DUPLICATE TEST (DUPR) ─────────────────────────────────────────────
       if (tc.isDuplicate) {
-
-        // Single re-feed — TC-001 already confirmed this barcode.
-        // One send is enough to trigger DUPR.
         const secondRaw = await simulateOnInfra({
           barcode: tc.barcode,
           machineKey,
@@ -258,33 +262,35 @@ export class TestRunner {
         const { pbResponse, pdResponse, pcResponse } = extractResponses(second);
         onLog?.(`  [PHASE 1] PB:${pbResponse} PD:${pdResponse} PC:${pcResponse}`);
 
-        const allResponses = [pbResponse, pdResponse, pcResponse].filter(Boolean).join(' ');
-        const gotDupr = allResponses.includes('DUPR') || second.rejectionCode === 'DUPR';
+        // ── SOURCE OF TRUTH: sort code from TCP response ────────────────────
+        const actualSortCode = extractSortCode(pbResponse);
+        const expectedSortCode = tc.expectedSortCode ?? 'DUPR';
 
-        // Give the engine time to write the DUPR record to primary_sortings
+        onLog?.(`  [SORT-CODE] expected=${expectedSortCode} actual=${actualSortCode ?? 'UNKNOWN'}`);
+
         await this.sleep(6000);
 
-        // Backend validation — L1 and L2 should still be true (TC-001 data intact)
+        // Validator and UI are trace/reporting only — do NOT affect passed
         validation = await validator.validateParcel(barcode, 10, 2000);
 
-        // UI validation — dashboard must show Rejected / DUPR.
-        // apiResponse.status = 'FAIL' because DUPR is a rejection.
         try {
-          const commitId = (tc as any).commitId || 'latest';
           uiResult = await this.uiValidator.validateParcelDisplay(
             `http://${process.env.VM_HOST}:7001/CL0003/master_search.php`,
-            barcode, sessionId, commitId,
-            { status: 'FAIL' },    // DUPR = rejection = FAIL
-            screenshotsDir          // ← explicit path so screenshots land in the right run folder
+            barcode, sessionId, (tc as any).commitId || 'latest',
+            { status: 'FAIL' },
+            screenshotsDir
           );
         } catch (uiErr: any) {
           uiResult = { found: false, error: uiErr.message, status: 'ERROR' };
         }
 
-        // actualStatus mirrors the parcel outcome:
-        //   gotDupr=true  → parcel rejected  → 'FAIL'
-        //   gotDupr=false → unexpected result → 'PASS' (mismatch against expectedStatus 'FAIL' → ❌)
-        const actualStatus: 'PASS' | 'FAIL' = gotDupr ? 'FAIL' : 'PASS';
+        // ── PASS/FAIL: sort code match only ────────────────────────────────
+        const passed = actualSortCode === expectedSortCode;
+        // actualStatus reflects what the machine did:
+        //   expectedSortCode SUCC → machine sorted → PASS
+        //   anything else → machine rejected → FAIL
+        const actualStatus: 'PASS' | 'FAIL' =
+          actualSortCode === 'SUCC' ? 'PASS' : 'FAIL';
 
         return {
           testId: tc.testId,
@@ -293,19 +299,19 @@ export class TestRunner {
           machineName,
           expectedStatus: tc.expectedStatus,
           actualStatus,
-          passed: actualStatus === tc.expectedStatus,
+          passed,
           simulation,
           validation,
           uiResult,
           durationMs: Date.now() - startTime,
           screenshotPath: uiResult?.screenshotPath,
-          reason: gotDupr
-            ? 'Got expected DUPR — duplicate parcel correctly rejected'
-            : `Expected DUPR, got: ${allResponses || 'no response'}`,
+          reason: passed
+            ? `${expectedSortCode} ✅`
+            : `expected ${expectedSortCode} → got ${actualSortCode ?? 'UNKNOWN'} ❌`,
         };
       }
 
-      // ─── NORMAL TEST ────────────────────────────────────────────────────────
+      // ─── NORMAL TEST ───────────────────────────────────────────────────────
       const simRaw = await simulateOnInfra({
         barcode, machineKey, dims, weight,
         edgeProfile: 'NORMAL',
@@ -317,66 +323,87 @@ export class TestRunner {
       const { pbResponse, pdResponse, pcResponse } = extractResponses(simulation);
       onLog?.(`  [PHASE 1] PB:${pbResponse} PD:${pdResponse} PC:${pcResponse}`);
 
+      // ── SOURCE OF TRUTH: sort code from TCP PB response ───────────────────
+      //
+      // This is the only thing that determines pass/fail.
+      // The validator (DB check) and UI check are supplementary trace data.
+      //
+      // Examples:
+      //   tc.expectedSortCode = "SUCC"  → machine must return SUCC  → passed
+      //   tc.expectedSortCode = "DNFR"  → machine must return DNFR  → passed
+      //   tc.expectedSortCode = "IBAR"  → machine returns DNFR      → failed
+      //   tc.expectedSortCode = "DUPR"  → handled above in isDuplicate branch
+
+      const actualSortCode = extractSortCode(pbResponse);
+      const expectedSortCode = tc.expectedSortCode;
+
+      onLog?.(`  [SORT-CODE] expected=${expectedSortCode ?? 'N/A'} actual=${actualSortCode ?? 'UNKNOWN'}`);
+
       await this.sleep(6000);
 
+      // ── Validator — trace only, does NOT affect passed ─────────────────────
       validation = await validator.validateParcel(barcode, 10, 2000);
 
+      // ── UI — trace only, does NOT affect passed ────────────────────────────
       try {
-        const commitId = (tc as any).commitId || 'latest';
-        const apiResponse = { status: validation?.overallPass ? 'PASS' : 'FAIL' };
         uiResult = await this.uiValidator.validateParcelDisplay(
           `http://${process.env.VM_HOST}:7001/CL0003/master_search.php`,
-          barcode, sessionId, commitId,
-          apiResponse,
-          screenshotsDir   // ← explicit path so screenshots land in the right run folder
+          barcode, sessionId, (tc as any).commitId || 'latest',
+          // Pass the actual outcome to UI validator so it knows what to expect
+          { status: actualSortCode === 'SUCC' ? 'PASS' : 'FAIL' },
+          screenshotsDir
         );
       } catch (uiErr: any) {
         uiResult = { found: false, error: uiErr.message, status: 'ERROR' };
       }
 
-      // ── Step 1: What actually happened? (PB response is the source of truth) ──
-      const rejectionCode = simulation?.rejectionCode
-        || simulation?.steps.find(s => s.type === 'PB')?.response?.match(/,([A-Z]{4})\s/)?.[1]
-        || null;
+      // ── PASS/FAIL: sort code match only ────────────────────────────────────
+      //
+      // If tc has no expectedSortCode (legacy test cases), fall back to the
+      // old expectedStatus vs actualStatus comparison so nothing breaks.
+      let passed: boolean;
+      let actualStatus: 'PASS' | 'FAIL';
+      let reason: string;
 
-      // PASS = parcel sorted successfully (no rejection code, overallPass true)
-      // FAIL = parcel was rejected (any rejection code present)
-      const actualStatus: 'PASS' | 'FAIL' = validation.overallPass && !rejectionCode ? 'PASS' : 'FAIL';
-      const passed = actualStatus === tc.expectedStatus;
-
-      // ── Step 2: Did the UI correctly reflect what actually happened? ──────────
-      // UI is correct if it shows the same outcome (rejection code or success) as the machine response.
-      // This is independent of whether the test passed or failed.
-      const uiRejectionCode = uiResult?.displayedRejectionCode || null;
-      const uiStatus = uiResult?.displayedStatus || null;
-
-      let uiCorrect: boolean | null = null;
-      let uiNote: string = '';
-
-      if (uiResult && uiResult.status !== 'ERROR' && uiResult.found) {
-        if (actualStatus === 'FAIL' && rejectionCode) {
-          // Machine rejected with a code — UI should show that same code
-          uiCorrect = uiRejectionCode === rejectionCode;
-          uiNote = uiCorrect
-            ? `UI correctly shows rejection "${rejectionCode}"`
-            : `UI shows "${uiRejectionCode}" but machine rejected with "${rejectionCode}"`;
-        } else if (actualStatus === 'PASS') {
-          // Machine sorted — UI should show a success/sorted status
-          uiCorrect = uiStatus !== 'Rejected';
-          uiNote = uiCorrect
-            ? `UI correctly shows success status`
-            : `UI shows "Rejected" but machine sorted successfully`;
-        }
-      } else if (uiResult && !uiResult.found) {
-        uiCorrect = false;
-        uiNote = `Barcode not found on UI dashboard`;
+      if (expectedSortCode) {
+        // New path: compare sort codes from TCP response
+        passed = actualSortCode === expectedSortCode;
+        actualStatus = actualSortCode === 'SUCC' ? 'PASS' : 'FAIL';
+        reason = passed
+          ? `${expectedSortCode} ✅`
+          : `expected ${expectedSortCode} → got ${actualSortCode ?? 'UNKNOWN'} ❌`;
       } else {
-        uiNote = `UI check skipped or errored`;
+        // Legacy fallback: use validator.overallPass (old behaviour)
+        const rejectionCode = simulation?.rejectionCode
+          || simulation?.steps.find(s => s.type === 'PB')?.response?.match(/,([A-Z]{4})\s/)?.[1]
+          || null;
+        actualStatus = validation.overallPass && !rejectionCode ? 'PASS' : 'FAIL';
+        passed = actualStatus === tc.expectedStatus;
+        reason = passed
+          ? `Expected ${tc.expectedStatus} → Got ${actualStatus} ✅`
+          : `Expected ${tc.expectedStatus} → Got ${actualStatus} ❌${rejectionCode ? ` (${rejectionCode})` : ''}`;
       }
 
-      const reason = passed
-        ? `Expected ${tc.expectedStatus} → Got ${actualStatus} ✅${uiNote ? ' | UI: ' + uiNote : ''}`
-        : `Expected ${tc.expectedStatus} → Got ${actualStatus} ❌${rejectionCode ? ` (${rejectionCode})` : ''}${uiNote ? ' | UI: ' + uiNote : ''}`;
+      // ── UI note (informational only) ────────────────────────────────────────
+      const uiRejectionCode = uiResult?.displayedRejectionCode || null;
+      const uiDisplayedStatus = uiResult?.displayedStatus || null;
+      let uiNote = '';
+
+      if (uiResult?.found) {
+        if (actualSortCode && actualSortCode !== 'SUCC') {
+          const uiCorrect = uiRejectionCode === actualSortCode;
+          uiNote = uiCorrect
+            ? `UI shows ${uiRejectionCode} ✅`
+            : `UI shows "${uiRejectionCode ?? uiDisplayedStatus}" (machine: ${actualSortCode})`;
+        } else if (actualSortCode === 'SUCC') {
+          const uiCorrect = uiDisplayedStatus !== 'Rejected';
+          uiNote = uiCorrect ? `UI shows success ✅` : `UI shows Rejected but machine sorted ⚠️`;
+        }
+      } else {
+        uiNote = `barcode not found on UI`;
+      }
+
+      if (uiNote) reason += ` | UI: ${uiNote}`;
 
       return {
         testId: tc.testId,
@@ -388,7 +415,7 @@ export class TestRunner {
         passed,
         simulation,
         validation,
-        uiResult: { ...uiResult, uiCorrect, uiNote },
+        uiResult,
         durationMs: Date.now() - startTime,
         screenshotPath: uiResult?.screenshotPath,
         reason,

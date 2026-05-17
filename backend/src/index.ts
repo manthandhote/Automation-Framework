@@ -9,7 +9,6 @@ import path from 'path';
 import fs from 'fs';
 import util from 'util';
 import { exec } from 'child_process';
-import { AdvancedSimulator } from './backend-tests/platform/advanced-simulator';
 import { LifecycleValidator } from './backend-tests/platform/lifecycle-validator';
 import { PipelineSimulator, PipelineStage } from './backend-tests/pipeline-simulator';
 import { Orchestrator } from './orchestrator';
@@ -39,7 +38,6 @@ InspectraDB.init(mongoUri, INSPECTRA_DB_NAME);
 
 const orchestrator = new Orchestrator(workspacePath);
 const validator = new LifecycleValidator(mongoUri);
-const simulator = new AdvancedSimulator();
 const pipelineSimulator = new PipelineSimulator();
 const uiValidator = new UIValidator();
 const inspectraDb = InspectraDB.getInstance();
@@ -271,8 +269,17 @@ app.post('/api/pipeline/pulse', async (req, res) => {
 app.post('/api/simulate', async (req, res) => {
   const { protocol = 'capella' } = req.body;
   const barcode = `AWB${Math.floor(Math.random() * 1000000000)}`;
-  const result = await simulator.runFullCycle(barcode, 'MA01', protocol as any);
-  res.json({ status: 'SIMULATING', protocol, barcode, result });
+  try {
+    // This now sends the request to the VM Agent instead of running locally
+    const result = await simulateOnInfra({
+      barcode,
+      machineKey: 'MA01',
+      options: { host: '127.0.0.1', port: 3000 }
+    });
+    res.json({ status: 'SIMULATING', protocol, barcode, result });
+  } catch (err: any) {
+    res.status(500).json({ status: 'ERROR', message: err.message });
+  }
 });
 
 app.get('/api/validate/:barcode', async (req, res) => {
@@ -408,10 +415,6 @@ app.post('/api/analyze-db', async (req, res) => {
   }
 });
 
-// ─── Real-time ────────────────────────────────────────────────────────────────
-simulator.on('packet', (data) => {
-  io.emit('simulator:packet', { data, timestamp: new Date() });
-});
 
 io.on('connection', (socket) => {
   logger.info(`Client connected: ${socket.id}`, 'SOCKET');
