@@ -77,5 +77,162 @@
         ]
       }
     }
+  ],
+  "flipkart_incoming": [
+    {
+      "item": {
+        "item_id": "ABCP1234567890",
+        "type": "SHIPMENT",
+        "labels": [
+          "FMPC6073850212",
+          "ABCP1234567890"
+        ]
+      },
+      "timestamp": 1778302493963,
+      "params": {
+        "params": {
+          "facilityId": "56487",
+          "installationId": "CSK_Sorter_Nido_1"
+        }
+      },
+      "sort_code": {
+        "ext": "0",
+        "qos": "E",
+        "size": "M",
+        "sellerloc": "423797",
+        "productcategory": "03",
+        "coc": "MYQ/MNY",
+        "vendor": "E",
+        "merchant": "O",
+        "goodstype": "S",
+        "flow": "F",
+        "lowcost": "false",
+        "pudogroup": ""
+      }
+    },
+    {
+      "item": {
+        "item_id": "11929876543210",
+        "type": "SHIPMENT",
+        "labels": [
+          "FMPP3983526851",
+          "11929876543210"
+        ]
+      },
+      "timestamp": 1778302493967,
+      "params": {
+        "params": {
+          "facilityId": "56487",
+          "installationId": "CSK_Sorter_Nido_1"
+        }
+      },
+      "sort_code": {
+        "ext": "0",
+        "qos": "E",
+        "size": "S",
+        "sellerloc": "423797",
+        "productcategory": "03",
+        "coc": "BTG/BTG",
+        "vendor": "E",
+        "merchant": "O",
+        "goodstype": "S",
+        "flow": "F",
+        "lowcost": "false",
+        "pudogroup": ""
+      }
+    },
+    {
+      "item": {
+        "item_id": "557351234567890",
+        "type": "SHIPMENT",
+        "labels": [
+          "FMPC6074123376",
+          "557351234567890"
+        ]
+      },
+      "timestamp": 1778302493969,
+      "params": {
+        "params": {
+          "facilityId": "56487",
+          "installationId": "CSK_Sorter_Nido_1"
+        }
+      },
+      "sort_code": {
+        "ext": "0",
+        "qos": "E",
+        "size": "S",
+        "sellerloc": "423797",
+        "productcategory": "03",
+        "coc": "IXE/SRK",
+        "vendor": "E",
+        "merchant": "O",
+        "goodstype": "S",
+        "flow": "F",
+        "lowcost": "false",
+        "pudogroup": ""
+      }
+    },
+    {
+      "item": {
+        "item_id": "MYSP1234567890",
+        "type": "SHIPMENT",
+        "labels": [
+          "FMPC6078267759",
+          "MYSP1234567890"
+        ]
+      },
+      "timestamp": 1778302499765,
+      "params": {
+        "params": {
+          "facilityId": "56487",
+          "installationId": "CSK_Sorter_Nido_1"
+        }
+      },
+      "sort_code": {
+        "ext": "0",
+        "qos": "X",
+        "size": "S",
+        "sellerloc": "402667",
+        "productcategory": "03",
+        "coc": "BLR/HUN",
+        "vendor": "E",
+        "merchant": "O",
+        "goodstype": "S",
+        "flow": "F",
+        "lowcost": "false",
+        "pudogroup": ""
+      }
+    },
+    {
+      "item": {
+        "item_id": "SLP4567890123",
+        "type": "SHIPMENT",
+        "labels": [
+          "FMPP3987241180",
+          "SLP4567890123"
+        ]
+      },
+      "timestamp": 1778302498797,
+      "params": {
+        "params": {
+          "facilityId": "56487",
+          "installationId": "CSK_Sorter_Nido_1"
+        }
+      },
+      "sort_code": {
+        "ext": "0",
+        "qos": "X",
+        "size": "S",
+        "sellerloc": "402667",
+        "productcategory": "03",
+        "coc": "BPL/BAN",
+        "vendor": "E",
+        "merchant": "O",
+        "goodstype": "S",
+        "flow": "F",
+        "lowcost": "false",
+        "pudogroup": ""
+      }
+    }
   ]
 }

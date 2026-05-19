@@ -14,6 +14,20 @@ export interface MachineInfo {
   status: boolean;
   configCount: number;
   configs: IncomingConfigInfo[];
+
+  // ── Port info extracted from machine doc ─────────────────────────────────
+  // tcpPort:              device_config.connection_pools[barcode device].port_name
+  //                       This is the TCP port the physical scanner/PLC connects to.
+  //                       Used by test-runner to send PB/PD/PC packets.
+  //
+  // appDevicePort:        machine_services_config['app-device-interface'].port
+  //                       One per machine — test-runner waits for this before tests.
+  //
+  // validationEnginePort: machine_services_config['validation-engine'].port
+  //                       One per machine — test-runner waits for this before tests.
+  tcpPort: number;
+  appDevicePort: number;
+  validationEnginePort: number;
 }
 
 export interface IncomingConfigInfo {
@@ -46,6 +60,10 @@ export class DbAnalyzer {
     this.restoredDbName = restoredDbName;
   }
 
+  public async mergeAllIntoSessionDb(): Promise<void> {
+    logger.info('[MERGE] mergeAllIntoSessionDb is bypassed — using original DBs', 'DB-ANALYZER');
+    return;
+  }
 
   async analyze(): Promise<DbSummary> {
     logger.info(`Analyzing databases (machines: machine_configurations, configs: ${this.restoredDbName})...`, 'DB-ANALYZER');
@@ -55,15 +73,12 @@ export class DbAnalyzer {
     const configTypes: Record<string, number> = {};
     let totalConfigs = 0;
 
-    // Machines always live in machine_configurations.machines.
-    // Configs live in their respective service DBs (incoming_service, sorting_service, etc.)
-    // which are all accessible via this.restoredDbName or scanned individually below.
     const MACHINE_DB = 'machine_configurations';
 
     try {
       await client.connect();
 
-      // ── Step 1: Read machines from machine_configurations.machines ────────
+      // ── Step 1: Read machines ─────────────────────────────────────────────
       const machineDb = client.db(MACHINE_DB);
       const rawMachines = await machineDb.collection('machines').find().toArray();
       logger.info(`[DIAGNOSTIC] Found ${rawMachines.length} docs in ${MACHINE_DB}.machines`, 'DB-ANALYZER');
@@ -72,20 +87,51 @@ export class DbAnalyzer {
         const id = (m._id ? m._id.toString() : null) || m.machine_id || m.machineId || m.id || m.code;
         const name = m.machine_name || m.machineName || m.name || id;
 
-        if (id) {
-          logger.info(`[DIAGNOSTIC] Found machine ID: ${id}`, 'DB-ANALYZER');
-          machines.push({
-            id: id.toString(),
-            name: name.toString(),
-            machine_key: m.machine_key || id.toString(),
-            type: m.machine_type || m.type || 'sorter',
-            location: m.machine_location || m.location || 'Local',
-            status: m.machine_status === 'Running' || m.status !== false,
-            configCount: 0,
-            configs: []
-          });
-          if (m.client_name) clients.add(m.client_name);
-        }
+        if (!id) continue;
+
+        logger.info(`[DIAGNOSTIC] Found machine ID: ${id}`, 'DB-ANALYZER');
+
+        // ── Extract TCP port ────────────────────────────────────────────────
+        // device_config.devices[data==='barcode'].connection_id
+        //   → device_config.connection_pools[connection_id].port_name
+        const barcodeDevice = (m.device_config?.devices || [])
+          .find((d: any) => d.data === 'barcode');
+        const barcodeConnectionId = barcodeDevice?.connection_id
+          ? parseInt(String(barcodeDevice.connection_id), 10)
+          : null;
+        const barcodePool = barcodeConnectionId !== null
+          ? (m.device_config?.connection_pools || [])
+            .find((cp: any) => parseInt(String(cp.connection_id), 10) === barcodeConnectionId)
+          : null;
+        const tcpPort = parseInt(String(barcodePool?.port_name || '3000'), 10);
+
+        // ── Extract per-machine service ports ───────────────────────────────
+        const svcConfig = m.machine_services_config || {};
+        const appDevicePort: number =
+          svcConfig['app-device-interface']?.port || 5500;
+        const validationEnginePort: number =
+          svcConfig['validation-engine']?.port || 5000;
+
+        logger.info(
+          `[DIAGNOSTIC] Machine ${name} (${id}) — TCP:${tcpPort} appDevice:${appDevicePort} validation:${validationEnginePort}`,
+          'DB-ANALYZER'
+        );
+
+        machines.push({
+          id: id.toString(),
+          name: name.toString(),
+          machine_key: m.machine_key || id.toString(),
+          type: m.machine_type || m.type || 'sorter',
+          location: m.machine_location || m.location || 'Local',
+          status: m.machine_status === 'Running' || m.status !== false,
+          configCount: 0,
+          configs: [],
+          tcpPort,
+          appDevicePort,
+          validationEnginePort,
+        });
+
+        if (m.client_name) clients.add(m.client_name);
       }
 
       // ── Step 2: Read configs from machine_configurations itself ───────────
@@ -124,7 +170,11 @@ export class DbAnalyzer {
 
       if (finalMachines.length === 0) {
         logger.warn(`[FALLBACK] No machines found in ${MACHINE_DB}.machines`, 'DB-ANALYZER');
-        finalMachines = [{ id: '', name: 'unknown', machine_key: 'unknown', type: 'sorter', location: 'unknown', status: true, configCount: 0, configs: [] }];
+        finalMachines = [{
+          id: '', name: 'unknown', machine_key: 'unknown', type: 'sorter',
+          location: 'unknown', status: true, configCount: 0, configs: [],
+          tcpPort: 3000, appDevicePort: 5500, validationEnginePort: 5000,
+        }];
       }
 
       if (finalMachines.filter(m => m.status).length === 0) {

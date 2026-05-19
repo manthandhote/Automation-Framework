@@ -86,7 +86,7 @@ export class BackendValidator {
     const overallPass = layer1.found && layer2.found;
 
     logger.info(
-      `[VALIDATOR] ${barcode} → found in incoming_data:${layer1.found ? '✅' : '❌'} | found in primary_sortings:${layer2.found ? '✅' : '❌'} | found in integration_logs:${layer3.found ? '✅' : '❌'} → ${overallPass ? '✅ PASS' : '❌ FAIL'}`,
+      `[VALIDATOR] ${barcode} → found in incoming_data:${layer1.found ? '✅' : '❌'} | found in primary_sortings:${layer2.found ? '✅' : '❌'} | found in integration_logs:${layer3.found ? '✅' : '❌'}`,
       'VALIDATOR'
     );
 

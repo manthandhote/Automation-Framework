@@ -5,24 +5,20 @@ import { NodeSSH } from 'node-ssh';
 import fs from 'fs';
 import path from 'path';
 import { logger } from './logger';
-const ECOSYSTEM_PATH = '/tmp/automyrix-ecosystem.config.js';
-import { exec } from 'child_process';
-import { promisify } from 'util';
-import { resolve } from 'dns';
-
-const execAsync = promisify(exec);
 
 export interface SeedResult {
-    pushed: string[];        // barcode values successfully POSTed
-    failed: string[];        // barcode values (or record indices) that failed
-    validAwb: string | null; // first successfully pushed barcode — used for SUCC + DUPR
+    pushed: string[];
+    failed: string[];
+    validAwb: string | null;
 }
 
 // ── Known destination_column names that represent the barcode/AWB ─────────────
-// Scanned in order — first match wins.
+// Checked in priority order — first match wins.
+// Add new client barcode field names here — no other code changes needed.
 const BARCODE_DESTINATION_COLUMNS = [
-    'awb',
-    'hu_id',
+    'awb',            // Meesho
+    'hu_id',          // DHL
+    'item_id',        // Flipkart
     'barcode',
     'awb_number',
     'tracking_no',
@@ -66,8 +62,8 @@ export class IncomingDataSeeder {
         const port: number = serviceConfig.port;
         onLog(`[SEEDER] incoming-service port resolved: ${port}`);
 
-        // 4. Select the correct push config
-        const pushConfig = await this.getPushConfig(machineDoc, onLog);
+        // 4. Select the correct push config (clientName passed for Strategy B fallback)
+        const pushConfig = await this.getPushConfig(machineDoc, clientName, onLog);
         if (!pushConfig) {
             throw new Error(`[SEEDER] No push-type incoming_config found for machine: ${machineId}`);
         }
@@ -80,7 +76,8 @@ export class IncomingDataSeeder {
         }
         onLog(`[SEEDER] Loaded ${records.length} records for client: ${clientName}`);
 
-        await this.startIncomingService(onLog);
+        // Start incoming-service on VM via SSH before pushing data
+        await this.startIncomingService(port, onLog);
 
         // 6. POST each record to VM incoming-service
         return await this.pushAll(records, pushConfig, port, onLog);
@@ -104,12 +101,15 @@ export class IncomingDataSeeder {
         }
     }
 
+    // ════════════════════════════════════════════════════════════════════════════
+    //  Start incoming-service on VM via SSH + PM2
+    //  (port is passed in so waitForPort uses the actual resolved port)
+    // ════════════════════════════════════════════════════════════════════════════
 
-    //Stsrt incoming service for seeding Data
-    private async startIncomingService(onLog: (msg: string) => void): Promise<void> {
+    private async startIncomingService(port: number, onLog: (msg: string) => void): Promise<void> {
         const ssh = new NodeSSH();
         try {
-            onLog('[SPAWNER] Starting Incoming-service');
+            onLog('[SPAWNER] Starting incoming-service on VM...');
 
             await ssh.connect({
                 host: this.vmIp,
@@ -119,15 +119,16 @@ export class IncomingDataSeeder {
 
             const result = await ssh.execCommand(
                 'sudo pm2 start /tmp/automyrix-ecosystem.config.js --only automyrix-incoming-service',
-                { execOptions: { pty: true } }  // pty needed for sudo
+                { execOptions: { pty: true } }
             );
 
             if (result.stdout) onLog(`[PM2] ${result.stdout.trim()}`);
             if (result.stderr) onLog(`[PM2] ${result.stderr.trim()}`);
 
-            await this.waitForPort(this.vmIp, 7000, 60000, onLog);
+            // Wait using the actual resolved port from machine_services_config
+            await this.waitForPort(this.vmIp, port, 60000, onLog);
 
-            onLog('Incoming-service Started');
+            onLog(`[SPAWNER] incoming-service ready on port ${port} ✅`);
         } finally {
             ssh.dispose();
         }
@@ -187,49 +188,87 @@ export class IncomingDataSeeder {
     // ════════════════════════════════════════════════════════════════════════════
     //  Step 4 — Select the correct push config
     //
-    //  Selection priority (first match wins):
-    //    1. destination_collection === 'incoming_service.incoming_data'
-    //    2. route.endpoint contains '/incoming/data'
-    //    3. configs[0]  ← last resort
+    //  Strategy A (primary): machine.incoming_data_config[] → ids → incoming_config
+    //    Used by: Meesho, DHL, Flipkart ANJ_SORTER_1
     //
-    //  Logs all candidates so selection is always visible.
+    //  Strategy B (fallback): when machine has no incoming_data_config,
+    //    scan incoming_service.incoming_config directly by client name.
+    //    Used by: machines where config refs are missing from machine doc.
+    //
+    //  Within results, selection priority:
+    //    1. destination_collection === 'incoming_service.incoming_data'
+    //       AND client name matches
+    //    2. destination_collection === 'incoming_service.incoming_data'
+    //    3. route.endpoint contains '/incoming'
+    //    4. configs[0]
     // ════════════════════════════════════════════════════════════════════════════
 
-    private async getPushConfig(machineDoc: any, onLog: (msg: string) => void): Promise<any | null> {
+    private async getPushConfig(
+        machineDoc: any,
+        clientName: string,
+        onLog: (msg: string) => void
+    ): Promise<any | null> {
         const configRefs: Array<{ id: string }> = machineDoc.incoming_data_config || [];
-        if (configRefs.length === 0) {
-            onLog(`[SEEDER] No incoming_data_config entries found on machine doc`);
-            return null;
-        }
-
-        const ids = configRefs.map(c => c.id);
-        onLog(`[SEEDER] Looking up ${ids.length} incoming config(s): ${ids.join(', ')}`);
-
         const client = new MongoClient(this.mongoUri);
+
         try {
             await client.connect();
-            const configs = await client
-                .db('incoming_service')
-                .collection('incoming_config')
-                .find({ _id: { $in: ids as any[] }, type: 'push' })
-                .toArray();
+            const collection = client.db('incoming_service').collection('incoming_config');
+            let configs: any[] = [];
+
+            if (configRefs.length > 0) {
+                // ── Strategy A: lookup by ids embedded in machine doc ──────────────
+                const ids = configRefs.map(c => c.id);
+                onLog(`[SEEDER] Strategy A — looking up ${ids.length} config id(s): ${ids.join(', ')}`);
+                configs = await collection
+                    .find({ _id: { $in: ids as any[] }, type: 'push' })
+                    .toArray();
+            }
 
             if (configs.length === 0) {
-                onLog(`[SEEDER] No push-type config found`);
+                // ── Strategy B: scan by client name ───────────────────────────────
+                onLog(`[SEEDER] Strategy B — scanning configs for client: "${clientName}"`);
+                configs = await collection
+                    .find({
+                        type: 'push',
+                        destination_collection: 'incoming_service.incoming_data',
+                        client: { $regex: new RegExp(`^${clientName}$`, 'i') },
+                    })
+                    .toArray();
+
+                if (configs.length === 0) {
+                    // Broaden: any push config targeting incoming_data
+                    onLog(`[SEEDER] Strategy B broadened — any push config targeting incoming_data`);
+                    configs = await collection
+                        .find({ type: 'push', destination_collection: 'incoming_service.incoming_data' })
+                        .toArray();
+                }
+            }
+
+            if (configs.length === 0) {
+                onLog(`[SEEDER] No push-type config found for client: ${clientName}`);
                 return null;
             }
 
             onLog(`[SEEDER] Found ${configs.length} push config(s):`);
             for (const c of configs) {
-                onLog(`  • "${c.name}" | dest_collection: ${c.destination_collection} | endpoint: ${c.route?.endpoint}`);
+                onLog(`  • "${c.name}" | client: ${c.client} | dest: ${c.destination_collection} | endpoint: ${c.route?.endpoint}`);
             }
 
+            const clientRegex = new RegExp(`^${clientName}$`, 'i');
             const chosen =
+                // Priority 1: correct collection + correct client
+                configs.find(c =>
+                    c.destination_collection === 'incoming_service.incoming_data' &&
+                    clientRegex.test(c.client || '')
+                ) ||
+                // Priority 2: correct collection, any client
                 configs.find(c => c.destination_collection === 'incoming_service.incoming_data') ||
-                configs.find(c => (c.route?.endpoint as string | undefined)?.includes('/incoming/data')) ||
+                // Priority 3: endpoint hint
+                configs.find(c => (c.route?.endpoint as string | undefined)?.includes('/incoming')) ||
                 configs[0];
 
-            onLog(`[SEEDER] Selected: "${chosen.name}"`);
+            onLog(`[SEEDER] Selected: "${chosen.name}" (client: ${chosen.client})`);
             return chosen;
 
         } finally {
@@ -242,8 +281,6 @@ export class IncomingDataSeeder {
     // ════════════════════════════════════════════════════════════════════════════
 
     private loadTestData(clientName: string, onLog: (msg: string) => void): any[] {
-        // workspacePath = Automation_testing root
-        // File: Automation_testing/backend/test-data/incoming-test.json
         const filePath = path.join(this.workspacePath, 'backend', 'test-data', 'incoming-test.json');
 
         if (!fs.existsSync(filePath)) {
@@ -252,11 +289,9 @@ export class IncomingDataSeeder {
 
         const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'));
 
-        // "Meesho" → "meesho_incoming",  "DHL" → "dhl_incoming"
+        // "Meesho" → "meesho_incoming", "Flipkart" → "flipkart_incoming"
         const key = `${clientName.toLowerCase()}_incoming`;
         const records = raw[key];
-
-
 
         if (!records || !Array.isArray(records) || records.length === 0) {
             onLog(`[SEEDER] No records found for key "${key}" in incoming-test.json`);
@@ -276,16 +311,17 @@ export class IncomingDataSeeder {
         port: number,
         onLog: (msg: string) => void
     ): Promise<SeedResult> {
-        const endpoint: string = config.route?.endpoint || '/api/v1/incoming/data';
+        const rawEndpoint: string = config.route?.endpoint || '/api/v1/incoming/data';
         const method: string = (config.route?.method || 'POST').toLowerCase();
         const targetPayload: string = config.target_payload ?? '';
-        const url = `http://${this.vmIp}:${port}${endpoint}`;
         const mappings: any[] = config.mappings || [];
 
-        onLog(`[SEEDER] Target URL: ${url}`);
-        onLog(`[SEEDER] Payload wrapper: ${targetPayload ? `"${targetPayload}"` : 'none (root level)'}`);
+        // Detect whether the payload wraps records as an array
+        // Meesho:   { "data": record }           → wrapAsArray = false
+        // Flipkart: { "sortation_data_list": [record] } → wrapAsArray = true
+        const wrapAsArray = this.isArrayPayload(config);
+        onLog(`[SEEDER] Payload mode: ${targetPayload ? `"${targetPayload}" (${wrapAsArray ? 'array' : 'object'})` : 'root level'}`);
 
-        // Find which source path resolves to the barcode for logging/tracking
         const barcodeSourcePath = this.findBarcodeSourcePath(mappings);
         onLog(`[SEEDER] Barcode source path: "${barcodeSourcePath ?? 'not detected'}"`);
 
@@ -300,9 +336,15 @@ export class IncomingDataSeeder {
                 : `record[${i}]`;
 
             try {
-                const payload = this.buildPayload(record, mappings, targetPayload);
+                // Substitute path params for this record before building URL
+                // e.g. /api/v2/facility/:facilityId/installation/:installationId/...
+                const resolvedEndpoint = this.substitutePathParams(rawEndpoint, record, mappings, onLog);
+                const url = `http://${this.vmIp}:${port}${resolvedEndpoint}`;
 
-                onLog(`[SEEDER] → Pushing barcode: ${barcodeValue}`);
+                const builtRecord = this.buildRecord(record, mappings);
+                const payload = this.wrapPayload(builtRecord, targetPayload, wrapAsArray);
+
+                onLog(`[SEEDER] → Pushing barcode: ${barcodeValue} to ${url}`);
                 logger.info(`[SEEDER] Payload: ${JSON.stringify(payload)}`, 'SEEDER');
 
                 const response = await axios({
@@ -330,14 +372,91 @@ export class IncomingDataSeeder {
     }
 
     // ════════════════════════════════════════════════════════════════════════════
+    //  Array payload detector
+    //
+    //  Returns true when target_payload should wrap the record in an array.
+    //  Detection: response_mapping[200].mappings[0].source_column === targetPayload
+    //             AND value_type === 'array'
+    //
+    //  Meesho:   target_payload="data"                → object → false
+    //  Flipkart: target_payload="sortation_data_list" → array  → true
+    // ════════════════════════════════════════════════════════════════════════════
+
+    private isArrayPayload(config: any): boolean {
+        const targetPayload = config.target_payload || '';
+        if (!targetPayload) return false;
+
+        const successMapping = config.response_mapping?.find(
+            (rm: any) => rm.http_status_code === 200
+        );
+        const firstMapping = successMapping?.mappings?.[0];
+        return (
+            firstMapping?.source_column === targetPayload &&
+            firstMapping?.value_type === 'array'
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  Path param substitution
+    //
+    //  Replaces :paramName tokens in the endpoint URL using values from the record.
+    //
+    //  Example:
+    //    endpoint = "/api/v2/facility/:facilityId/installation/:installationId/..."
+    //    mapping  = { source_column: "params.params.facilityId", destination_column: "facility_id" }
+    //    record   = { params: { params: { facilityId: "FAC001", installationId: "INST001" } } }
+    //    result   = "/api/v2/facility/FAC001/installation/INST001/..."
+    // ════════════════════════════════════════════════════════════════════════════
+
+    private substitutePathParams(
+        endpoint: string,
+        record: any,
+        mappings: any[],
+        onLog: (msg: string) => void
+    ): string {
+        const paramRegex = /:([a-zA-Z]+)/g;
+        const params = [...endpoint.matchAll(paramRegex)].map(m => m[1]);
+        if (params.length === 0) return endpoint;
+
+        let resolved = endpoint;
+
+        for (const paramName of params) {
+            // Convert camelCase param to snake_case for destination_column matching
+            const snakeCase = paramName.replace(/([A-Z])/g, '_$1').toLowerCase();
+
+            // Find the mapping whose destination_column matches this param name
+            const mapping = mappings.find(m =>
+                m.source_column &&
+                (m.destination_column === paramName || m.destination_column === snakeCase)
+            );
+
+            if (mapping) {
+                const value = this.resolvePath(record, mapping.source_column);
+                if (value !== undefined && value !== null) {
+                    resolved = resolved.replace(`:${paramName}`, String(value));
+                    onLog(`[SEEDER] Path param :${paramName} → "${value}" (from ${mapping.source_column})`);
+                } else {
+                    onLog(`[SEEDER] ⚠️ Path param :${paramName} — "${mapping.source_column}" resolved to null in record`);
+                }
+            } else {
+                // Last resort: try to resolve directly from record
+                const directValue =
+                    this.resolvePath(record, paramName) ??
+                    this.resolvePath(record, snakeCase);
+                if (directValue !== undefined && directValue !== null) {
+                    resolved = resolved.replace(`:${paramName}`, String(directValue));
+                    onLog(`[SEEDER] Path param :${paramName} → "${directValue}" (direct record field)`);
+                } else {
+                    onLog(`[SEEDER] ⚠️ No mapping for path param :${paramName} — leaving as-is`);
+                }
+            }
+        }
+
+        return resolved;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
     //  Barcode field detector
-    //
-    //  Scans mappings for the first one whose destination_column is a known
-    //  barcode name. Returns the source_column path so we can deep-resolve the
-    //  barcode value from any test-data record structure.
-    //
-    //  Meesho: dest="awb"   → source="awb"
-    //  DHL:    dest="hu_id" → source="packConfirmResponse.labels.0.huIdentifier"
     // ════════════════════════════════════════════════════════════════════════════
 
     private findBarcodeSourcePath(mappings: any[]): string | null {
@@ -362,10 +481,6 @@ export class IncomingDataSeeder {
 
     // ════════════════════════════════════════════════════════════════════════════
     //  Deep path resolver
-    //
-    //  resolvePath(obj, "awb")                                   → obj.awb
-    //  resolvePath(obj, "packConfirmResponse.transport.carrier") → obj.packConfirmResponse.transport.carrier
-    //  resolvePath(obj, "packConfirmResponse.labels.0.huIdentifier") → obj.packConfirmResponse.labels[0].huIdentifier
     // ════════════════════════════════════════════════════════════════════════════
 
     private resolvePath(obj: any, dotPath: string): any {
@@ -378,73 +493,48 @@ export class IncomingDataSeeder {
     }
 
     // ════════════════════════════════════════════════════════════════════════════
-    //  Payload builder — RECORD-FIRST STRATEGY
+    //  Record builder — RECORD-FIRST STRATEGY
     //
-    //  WHY record-first:
-    //
-    //  The incoming-service mapping engine resolves source_column paths FROM the
-    //  request body. For Meesho, source_columns are flat ("awb", "next_node") so
-    //  the record IS the payload. For DHL, source_columns are nested paths
-    //  ("packConfirmResponse.transport.carrier") — the service resolves these from
-    //  the nested JSON, not from flat dot-notation keys.
-    //
-    //  So the correct approach for ALL clients is:
-    //    1. Start with a deep copy of the record (all Direct + Nested fields
-    //       are already present in the correct shape)
-    //    2. Overlay GUID / Static / Now values using destination_column as key
-    //       (these have no source — they're generated server-side or at push time)
-    //    3. Wrap with target_payload if non-empty
-    //
-    //  Result by client:
-    //
-    //  Meesho  → { "data": { "awb":"VL...", "next_node":"FHE", ...,
-    //                         "_id":"<uuid>", "status":"queued", "upload_time":"..." } }
-    //
-    //  DHL     → { "uniqueTransactionId":"...", "packConfirmResponse":{ ... },
-    //               "_id":"<uuid>", "upload_time":"..." }
-    //            (no wrapper — target_payload is empty)
+    //  1. Deep-clone the record (Direct/Nested fields already present)
+    //  2. Overlay GUID / Static / Now generated values at top level
     // ════════════════════════════════════════════════════════════════════════════
 
-    private buildPayload(
-        record: any,
-        mappings: any[],
-        targetPayload: string
-    ): Record<string, any> {
-
-        // Deep-clone the record so we never mutate the original
+    private buildRecord(record: any, mappings: any[]): Record<string, any> {
         const built: Record<string, any> = JSON.parse(JSON.stringify(record));
 
-        // Overlay only the generated fields (GUID / Static / Now)
-        // Direct and Nested fields are already present in `built` from the record
         for (const mapping of mappings) {
             const format: string = mapping.format || 'Direct';
-
             switch (format) {
-
                 case 'GUID':
-                    // destination_column e.g. "_id" — add at top level
                     built[mapping.destination_column] = uuidv4();
                     break;
-
                 case 'Static':
-                    // destination_column e.g. "status", value e.g. "queued"
                     built[mapping.destination_column] = mapping.value;
                     break;
-
                 case 'Now':
-                    // destination_column e.g. "upload_time"
                     built[mapping.destination_column] = new Date().toISOString();
                     break;
-
-                // Direct / Nested: already present from the record — skip
-                default:
-                    break;
+                // Direct / Nested: already in record — skip
             }
         }
 
-        // Wrap only when target_payload is a non-empty string
-        // Meesho: target_payload = "data"  → { "data": built }
-        // DHL:    target_payload = ""      → built directly
-        return targetPayload ? { [targetPayload]: built } : built;
+        return built;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  Payload wrapper
+    //
+    //  targetPayload=""          → built directly               (DHL)
+    //  targetPayload="data"      + array=false → { "data": built }         (Meesho)
+    //  targetPayload="sortation_data_list" + array=true  → { "sortation_data_list": [built] } (Flipkart)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    private wrapPayload(
+        built: Record<string, any>,
+        targetPayload: string,
+        wrapAsArray: boolean
+    ): Record<string, any> {
+        if (!targetPayload) return built;
+        return { [targetPayload]: wrapAsArray ? [built] : built };
     }
 }

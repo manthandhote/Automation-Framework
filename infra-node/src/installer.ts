@@ -287,23 +287,38 @@ export class Installer {
       if (await Installer.pathExists(backendDest)) {
         onProgress('Backend repo exists — safely pulling latest...');
 
-        // stash local env changes
+        // 1. Read the current .env content so we can restore it
+        let envBackup: string | null = null;
+        const envPath = `${backendDest}/apps/incoming-service/.env`;
+
+        try {
+          const { stdout } = await execAsync(`cat ${envPath}`, { env: NO_PROMPT_ENV });
+          envBackup = stdout;
+          onProgress('📦 Backed up .env before pull');
+        } catch {
+          // .env doesn't exist yet — nothing to back up
+        }
+
+        // 2. Discard local changes to .env so git pull can proceed
         await execAsync(
-          `git -C ${backendDest} stash push -- apps/incoming-service/.env || true`,
-          { env: NO_PROMPT_ENV, timeout: 30000 }
+          `git -C ${backendDest} checkout -- apps/incoming-service/.env || true`,
+          { env: NO_PROMPT_ENV, timeout: 10000 }
         );
 
-        // pull latest
+        // 3. Pull latest
         await execAsync(
           `git -C ${backendDest} pull`,
           { env: NO_PROMPT_ENV, timeout: 120000 }
         );
 
-        // restore env
-        await execAsync(
-          `git -C ${backendDest} stash pop || true`,
-          { env: NO_PROMPT_ENV, timeout: 30000 }
-        );
+        // 4. Restore the original .env (don't let git overwrite prod config)
+        if (envBackup !== null) {
+          await execAsync(
+            `printf '%s' ${JSON.stringify(envBackup)} | ${SUDO} tee ${envPath} > /dev/null`,
+            { env: NO_PROMPT_ENV }
+          );
+          onProgress('✅ .env restored after pull');
+        }
       } else {
         onProgress(`Cloning backend (branch: ${backendBranch})...`);
         const { stderr } = await execAsync(

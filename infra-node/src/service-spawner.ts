@@ -7,15 +7,23 @@ import { logger } from './logger';
 
 const execAsync = util.promisify(exec);
 
-// ─── Static service definitions ───────────────────────────────────────────────
-// Port is NOT hardcoded here — resolved at runtime from machine_services_config.
-// configKey = the key name inside machine_services_config in the machine document.
-// Note: dataposting-service folder = 'dataposting-service' but its config key
-//       in the machine document is 'datauploader-service'.
-const SERVICES = [
+// ─── Service definitions ──────────────────────────────────────────────────────
+//
+// PER_MACHINE_SERVICES: one instance per machine, named with machine key suffix
+//   e.g. automyrix-app-device-interface-MA01, automyrix-validation-engine-MA01
+//
+// SHARED_SERVICES: one instance shared by all machines
+//   e.g. automyrix-incoming-service, automyrix-mapper-service
+//
+// configKey = the key inside machine_services_config in the machine document.
+
+const PER_MACHINE_SERVICES = [
     { name: 'app-device-interface', script: 'src/app.ts', configKey: 'app-device-interface' },
-    { name: 'incoming-service', script: 'src/Server.ts', configKey: 'incoming-service' },
     { name: 'validation-engine', script: 'src/app.ts', configKey: 'validation-engine' },
+];
+
+const SHARED_SERVICES = [
+    { name: 'incoming-service', script: 'src/Server.ts', configKey: 'incoming-service' },
     { name: 'mapper-service', script: 'src/Server.ts', configKey: 'mapper-service' },
     { name: 'dataposting-service', script: 'src/Server.ts', configKey: 'datauploader-service' },
     { name: 'backend-for-frontend', script: 'src/server.ts', configKey: 'backend-for-frontend' },
@@ -24,13 +32,27 @@ const SERVICES = [
 const PM2_PREFIX = 'automyrix';
 const ECOSYSTEM_PATH = '/tmp/automyrix-ecosystem.config.js';
 
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+export interface PerMachineConfig {
+    machineId: string;
+    machineKey: string;       // e.g. "MA01"
+    machineName?: string;
+    tcpPort?: number;
+    services: Record<string, { port: number }>;
+}
+
 export interface SpawnConfig {
     bePath: string;
     sessionId: string;
     mongoUri: string;
     dbName: string;
+    // Legacy single-machine fields (still accepted for backward compat)
     machineId: string;
     machineKey: string;
+    // New multi-machine fields
+    machines?: PerMachineConfig[];
+    sharedServices?: Record<string, { port: number }>;
     onLog: (msg: string) => void;
 }
 
@@ -39,13 +61,8 @@ interface ServiceEndpoint {
     port: number;
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── .env helpers ─────────────────────────────────────────────────────────────
 
-/**
- * Parse an existing .env file into a key→value map.
- * Lines starting with # (comments) and blank lines are preserved as-is
- * in the raw text but are skipped for the map.
- */
 function parseEnvFile(envPath: string): Record<string, string> {
     if (!fs.existsSync(envPath)) return {};
     const lines = fs.readFileSync(envPath, 'utf8').split('\n');
@@ -57,28 +74,17 @@ function parseEnvFile(envPath: string): Record<string, string> {
         if (eqIdx === -1) continue;
         const key = line.substring(0, eqIdx).trim();
         const raw = line.substring(eqIdx + 1).trim();
-        // Strip surrounding single or double quotes so "machine_configurations"
-        // doesn't reach MongoDB with the quote characters included.
-        const val = raw.replace(/^(['"])(.*)\1$/, '$2');
-        result[key] = val;
+        result[key] = raw.replace(/^(['"])(.*)\1$/, '$2');
     }
     return result;
 }
 
-/**
- * Patch specific keys into an existing .env file.
- * - Existing keys are updated in-place (preserving order and comments).
- * - Keys not already present are appended at the end.
- * - All other lines (comments, blanks, other keys) are left untouched.
- */
 function patchEnvFile(envPath: string, patches: Record<string, string>): void {
     const remaining = { ...patches };
-
     let lines: string[] = fs.existsSync(envPath)
         ? fs.readFileSync(envPath, 'utf8').split('\n')
         : [];
 
-    // Update existing keys in-place
     lines = lines.map(line => {
         const trimmed = line.trim();
         if (!trimmed || trimmed.startsWith('#')) return line;
@@ -93,7 +99,6 @@ function patchEnvFile(envPath: string, patches: Record<string, string>): void {
         return line;
     });
 
-    // Append any keys that weren't already in the file
     for (const [key, val] of Object.entries(remaining)) {
         lines.push(`${key}=${val}`);
     }
@@ -101,14 +106,13 @@ function patchEnvFile(envPath: string, patches: Record<string, string>): void {
     fs.writeFileSync(envPath, lines.join('\n'), 'utf8');
 }
 
+// ─── Main class ───────────────────────────────────────────────────────────────
+
 export class ServiceSpawner {
 
-    // ── Public API ─────────────────────────────────────────────────────────────
-
     static async spawnAll(config: SpawnConfig): Promise<{ success: boolean; error?: string }> {
-        const { bePath, sessionId, mongoUri, dbName, machineId, machineKey, onLog } = config;
+        const { bePath, sessionId, mongoUri, machineId, machineKey, onLog } = config;
 
-        // 1. Stop any previously running automyrix PM2 processes
         await ServiceSpawner.stopAll(sessionId, onLog);
 
         const appsPath = path.join(bePath, 'apps');
@@ -116,45 +120,143 @@ export class ServiceSpawner {
             return { success: false, error: `apps/ folder not found at ${bePath}` };
         }
 
-        // 2. Fetch machine_services_config from MongoDB
-        onLog(`[SPAWNER] Fetching machine_services_config for machineId: ${machineId}...`);
-        let machineServicesConfig: Record<string, ServiceEndpoint> = {};
-        try {
-            machineServicesConfig = await ServiceSpawner.fetchMachineServicesConfig(mongoUri, machineId);
-            const portSummary = Object.entries(machineServicesConfig)
-                .map(([k, v]) => `${k}:${v.port}`)
-                .join(', ');
-            onLog(`[SPAWNER] Ports from machine_services_config → ${portSummary}`);
-        } catch (e: any) {
-            onLog(`[SPAWNER] ⚠️  Could not load machine_services_config: ${e.message} — services will be skipped`);
+        // ── Resolve machine list ────────────────────────────────────────────────
+        // Use new machines[] if provided, otherwise fall back to single machine.
+        let machines: PerMachineConfig[] = config.machines || [];
+
+        if (machines.length === 0) {
+            // Legacy path: fetch from DB using single machineId
+            onLog(`[SPAWNER] Fetching machine_services_config for machineId: ${machineId}...`);
+            try {
+                const svcConfig = await ServiceSpawner.fetchMachineServicesConfig(mongoUri, machineId);
+                const portSummary = Object.entries(svcConfig).map(([k, v]) => `${k}:${v.port}`).join(', ');
+                onLog(`[SPAWNER] Ports from machine_services_config → ${portSummary}`);
+
+                machines = [{
+                    machineId,
+                    machineKey,
+                    services: Object.fromEntries(
+                        Object.entries(svcConfig).map(([k, v]) => [k, { port: v.port }])
+                    )
+                }];
+            } catch (e: any) {
+                onLog(`[SPAWNER] ⚠️  Could not load machine_services_config: ${e.message}`);
+                return { success: false, error: e.message };
+            }
         }
 
-        // 3. Build shared libs
+        // Shared services port resolution:
+        // Use sharedServices from orchestrator if provided,
+        // otherwise read from first machine's services config.
+        const sharedServicePorts: Record<string, number> = {};
+        if (config.sharedServices) {
+            for (const [key, val] of Object.entries(config.sharedServices)) {
+                sharedServicePorts[key] = val.port;
+            }
+        } else {
+            // Fallback: read from first machine
+            const firstMachine = machines[0];
+            for (const svc of SHARED_SERVICES) {
+                const port = firstMachine.services[svc.configKey]?.port;
+                if (port) sharedServicePorts[svc.configKey] = port;
+            }
+        }
+
+        onLog(`[SPAWNER] Architecture: ${machines.length} machine(s) × ${PER_MACHINE_SERVICES.length} per-machine + ${SHARED_SERVICES.length} shared`);
+
+        // Build shared libs once
         try {
             await ServiceSpawner.buildSharedLibs(bePath, onLog);
         } catch (e: any) {
             return { success: false, error: `Shared lib build failed: ${e.message}` };
         }
 
-        // 4. Patch .env + build PM2 app entry for each service
         const ecosystemApps: object[] = [];
 
-        for (const svc of SERVICES) {
+        // ── PER-MACHINE services ────────────────────────────────────────────────
+        // For each machine: spawn app-device-interface-MAxx and validation-engine-MAxx
+        // on that machine's dedicated port with MACHINE_ID pointing to that machine.
+        for (const machine of machines) {
+            for (const svc of PER_MACHINE_SERVICES) {
+                const svcPath = path.join(appsPath, svc.name);
+                if (!fs.existsSync(svcPath)) {
+                    onLog(`[SPAWNER] ⚠️  ${svc.name} not found — skipping`);
+                    continue;
+                }
+
+                const port = machine.services[svc.configKey]?.port;
+                if (!port) {
+                    onLog(`[SPAWNER] ⚠️  No port for ${svc.configKey} on machine ${machine.machineKey} — skipping`);
+                    continue;
+                }
+
+                // Install deps if missing (only once — node_modules shared across instances)
+                if (!fs.existsSync(path.join(svcPath, 'node_modules'))) {
+                    onLog(`[SPAWNER] Installing deps for ${svc.name}...`);
+                    try {
+                        await execAsync('npm install --ignore-scripts', { cwd: svcPath });
+                    } catch (e: any) {
+                        onLog(`[SPAWNER] ⚠️  npm install failed for ${svc.name}: ${e.message}`);
+                    }
+                }
+
+                // Each machine instance gets its own .env copy so ports don't collide
+                // Original .env is copied to .env.MA01, .env.MA02 etc. then patched.
+                const envFilePath = path.join(svcPath, '.env');
+                const machineEnvPath = path.join(svcPath, `.env.${machine.machineKey}`);
+
+                // Copy original .env as the base for this machine's env if not yet done
+                if (!fs.existsSync(machineEnvPath) && fs.existsSync(envFilePath)) {
+                    fs.copyFileSync(envFilePath, machineEnvPath);
+                }
+
+                const patches: Record<string, string> = {
+                    PORT: port.toString(),
+                    MONGO_URI: mongoUri,
+                    MONGODB_URI: mongoUri,
+                };
+
+                if (svc.name === 'app-device-interface') {
+                    patches['MACHINE_ID'] = machine.machineId;
+                }
+
+                patchEnvFile(machineEnvPath, patches);
+
+                const finalEnv = parseEnvFile(machineEnvPath);
+                const pm2Name = `${PM2_PREFIX}-${svc.name}-${machine.machineKey}`;
+
+                onLog(`[SPAWNER] ✅ ${pm2Name} → port ${port} | MACHINE_ID=${machine.machineId}`);
+
+                ecosystemApps.push({
+                    name: pm2Name,
+                    script: svc.script,
+                    interpreter: 'node',
+                    interpreterArgs: ['--import', 'tsx'],
+                    cwd: svcPath,
+                    watch: false,
+                    exec_mode: 'fork',
+                    instances: 1,
+                    autorestart: false,
+                    env: finalEnv,
+                });
+            }
+        }
+
+        // ── SHARED services ─────────────────────────────────────────────────────
+        // One instance each, port from sharedServicePorts.
+        for (const svc of SHARED_SERVICES) {
             const svcPath = path.join(appsPath, svc.name);
             if (!fs.existsSync(svcPath)) {
-                onLog(`[SPAWNER] ⚠️  ${svc.name} not found at ${svcPath} — skipping`);
+                onLog(`[SPAWNER] ⚠️  ${svc.name} not found — skipping`);
                 continue;
             }
 
-            // Resolve port from machine_services_config
-            const endpoint = machineServicesConfig[svc.configKey];
-            if (!endpoint) {
-                onLog(`[SPAWNER] ⚠️  No entry for '${svc.configKey}' in machine_services_config — skipping ${svc.name}`);
+            const port = sharedServicePorts[svc.configKey];
+            if (!port) {
+                onLog(`[SPAWNER] ⚠️  No port for shared service ${svc.name} — skipping`);
                 continue;
             }
-            const port = endpoint.port;
 
-            // Install node_modules if missing
             if (!fs.existsSync(path.join(svcPath, 'node_modules'))) {
                 onLog(`[SPAWNER] Installing deps for ${svc.name}...`);
                 try {
@@ -164,29 +266,16 @@ export class ServiceSpawner {
                 }
             }
 
-            // ── Patch .env (read existing → update only what we own) ──────────
             const envFilePath = path.join(svcPath, '.env');
-
-            // Keys we always set for every service
             const patches: Record<string, string> = {
                 PORT: port.toString(),
                 MONGO_URI: mongoUri,
                 MONGODB_URI: mongoUri,
             };
-
-            // app-device-interface also gets MACHINE_ID from the user's selection
-            if (svc.name === 'app-device-interface') {
-                patches['MACHINE_ID'] = machineId;
-                // MACHINE_KEY is intentionally NOT written — kept as-is in .env
-            }
-
             patchEnvFile(envFilePath, patches);
-            onLog(`[SPAWNER] ✅ .env patched for ${svc.name} (PORT=${port}, MONGO_URI set${svc.name === 'app-device-interface' ? `, MACHINE_ID=${machineId}` : ''})`);
-
-            // Read the final merged env to pass into PM2
             const finalEnv = parseEnvFile(envFilePath);
 
-            onLog(`[SPAWNER] ➡ ${svc.name} → port ${port}`);
+            onLog(`[SPAWNER] ✅ ${PM2_PREFIX}-${svc.name} → port ${port} (shared)`);
 
             ecosystemApps.push({
                 name: `${PM2_PREFIX}-${svc.name}`,
@@ -198,27 +287,28 @@ export class ServiceSpawner {
                 exec_mode: 'fork',
                 instances: 1,
                 autorestart: false,
-                env: finalEnv,      // ← PM2 gets the full patched .env, not a hand-rolled subset
+                env: finalEnv,
             });
         }
 
         if (ecosystemApps.length === 0) {
-            return { success: false, error: 'No services could be resolved from machine_services_config.' };
+            return { success: false, error: 'No services could be built for ecosystem.' };
         }
 
-        // 5. Write ecosystem file
-        const ecosystemContent =
-            `module.exports = { apps: ${JSON.stringify(ecosystemApps, null, 2)} };`;
+        // Write ecosystem config
+        const ecosystemContent = `module.exports = { apps: ${JSON.stringify(ecosystemApps, null, 2)} };`;
         fs.writeFileSync(ECOSYSTEM_PATH, ecosystemContent);
         onLog(`[SPAWNER] Ecosystem config written → ${ECOSYSTEM_PATH} (${ecosystemApps.length} apps)`);
 
-        // 6. Start via PM2
+        // Log the full manifest
+        const perMachineCount = machines.length * PER_MACHINE_SERVICES.length;
+        const sharedCount = SHARED_SERVICES.filter(s => sharedServicePorts[s.configKey]).length;
+        onLog(`[SPAWNER] Manifest: ${perMachineCount} per-machine + ${sharedCount} shared = ${ecosystemApps.length} total`);
+
+        // Start via PM2
         try {
             onLog(`[SPAWNER] Starting ${ecosystemApps.length} services via PM2...`);
-            const { stdout, stderr } = await execAsync(
-                `sudo pm2 start ${ECOSYSTEM_PATH}`,
-                { timeout: 120000 }
-            );
+            const { stdout, stderr } = await execAsync(`sudo pm2 start ${ECOSYSTEM_PATH}`, { timeout: 120000 });
             if (stdout) onLog(`[PM2] ${stdout.trim()}`);
             if (stderr) onLog(`[PM2] ${stderr.trim()}`);
         } catch (e: any) {
@@ -227,17 +317,18 @@ export class ServiceSpawner {
 
         onLog(`[SPAWNER] ✅ All services started via PM2`);
 
-        // 7. Stream PM2 logs to socket
+        // Stream PM2 logs to socket
         ServiceSpawner.streamPm2Logs(onLog);
 
-        // 8. Wait for app-device-interface HTTP port to confirm readiness
-        const appDevicePort = machineServicesConfig['app-device-interface']?.port || 5500;
-        await ServiceSpawner.waitForPort(appDevicePort, 60000, onLog);
+        // Wait for the first machine's app-device-interface to confirm services are starting
+        // (full readiness is confirmed by test-runner's waitForAllServices)
+        const firstAppDevicePort = machines[0]?.services['app-device-interface']?.port || 5500;
+        await ServiceSpawner.waitForPort(firstAppDevicePort, 60000, onLog);
 
         return { success: true };
     }
 
-    // ── Fetch machine_services_config from MongoDB ────────────────────────────
+    // ── Fetch machine_services_config (legacy single-machine path) ───────────
 
     private static async fetchMachineServicesConfig(
         mongoUri: string,
@@ -252,24 +343,21 @@ export class ServiceSpawner {
                 .findOne({ _id: machineId as any });
 
             if (!doc) throw new Error(`Machine document not found for ID: ${machineId}`);
-            if (!doc.machine_services_config) throw new Error(`machine_services_config missing in machine document`);
-
+            if (!doc.machine_services_config) throw new Error(`machine_services_config missing`);
             return doc.machine_services_config as Record<string, ServiceEndpoint>;
         } finally {
             await client.close();
         }
     }
 
-    // ── Stop all automyrix PM2 processes ──────────────────────────────────────
+    // ── Stop all automyrix PM2 processes ─────────────────────────────────────
 
     static async stopAll(sessionId: string, onLog: (msg: string) => void) {
         onLog(`[SPAWNER] Stopping previous PM2 processes (prefix: ${PM2_PREFIX})...`);
         try {
             const { stdout } = await execAsync(`sudo pm2 jlist`, { timeout: 10000 });
             const list: any[] = JSON.parse(stdout || '[]');
-            const ours = list
-                .filter(p => p.name?.startsWith(PM2_PREFIX))
-                .map(p => p.name);
+            const ours = list.filter(p => p.name?.startsWith(PM2_PREFIX)).map(p => p.name);
 
             if (ours.length > 0) {
                 await execAsync(`sudo pm2 delete ${ours.join(' ')}`, { timeout: 30000 });
@@ -282,7 +370,7 @@ export class ServiceSpawner {
         }
     }
 
-    // ── Stream PM2 logs → onLog ───────────────────────────────────────────────
+    // ── Stream PM2 logs ───────────────────────────────────────────────────────
 
     private static streamPm2Logs(onLog: (msg: string) => void) {
         try {

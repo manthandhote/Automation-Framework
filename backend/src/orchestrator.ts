@@ -442,7 +442,7 @@ export class Orchestrator {
           const seedResult = await seeder.seed(session.clientName, seedMachine.id, onLog);
           pushedAwbs = seedResult.pushed;
           onLog(`[SEEDER] ✅ Rerun seed complete: ${pushedAwbs.length} AWBs. validAwb: ${seedResult.validAwb}`);
-          onLog(`Push Configurations are Working fine ========>${pushedAwbs}`)
+          
         } catch (e: any) {
           onLog(`[WARNING] Rerun seed failed: ${e.message} — falling back to DB lookup`);
         }
@@ -548,22 +548,80 @@ export class Orchestrator {
     dbSummary?: DbSummary, selectedMachineId?: string
   ) {
     onProgress?.('Starting VM Services', 78);
+
     try {
       await this.cleanupSortingDatabase(onLog);
     } catch (e: any) {
       onLog?.(`[WARNING] Failed to cleanup DB before test run: ${e.message}`);
     }
 
+    // ── Build per-machine service manifest ──────────────────────────────────
+    //
+    // Architecture:
+    //   Per-machine (one instance per machine):
+    //     • app-device-interface  — port from machine.machine_services_config
+    //     • validation-engine     — port from machine.machine_services_config
+    //
+    //   Shared (one instance, all machines use the same):
+    //     • incoming-service
+    //     • mapper-service
+    //     • dataposting-service
+    //     • backend-for-frontend
+    //
+    // The infra-node receives a `machines` array so it knows exactly which
+    // services to spawn on which ports. Shared service ports come from the
+    // first (or selected) machine's config — they are the same across all machines.
+
+    const activeMachines = (dbSummary?.machines || []).filter(m => m.status);
     const selectedMachine = selectedMachineId
       ? dbSummary?.machines.find(m => m.id === selectedMachineId)
-      : dbSummary?.machines[0];
+      : activeMachines[0];
+
+    // Per-machine service descriptors — one entry per machine
+    const perMachineServices = activeMachines.map(m => ({
+      machineId: m.id,
+      machineKey: (m as any).machine_key || 'MA01',
+      machineName: m.name,
+      tcpPort: (m as any).tcpPort || 3000,
+      services: {
+        'app-device-interface': { port: (m as any).appDevicePort || 5500 },
+        'validation-engine': { port: (m as any).validationEnginePort || 5000 },
+      }
+    }));
+
+    // Shared services — read from selected machine config (same across all)
+    // If machine_services_config is not present, fall back to defaults
+    const sharedMachineConfig = (selectedMachine as any)?.machine_services_config || {};
+    const sharedServices = {
+      'incoming-service': { port: sharedMachineConfig['incoming-service']?.port || 7000 },
+      'mapper-service': { port: sharedMachineConfig['mapper-service']?.port || 4000 },
+      'dataposting-service': { port: sharedMachineConfig['datauploader-service']?.port || 4100 },
+      'backend-for-frontend': { port: sharedMachineConfig['backend-for-frontend']?.port || 5026 },
+    };
+
+    onLog?.(`[ORCHESTRATOR] Spawning services for ${activeMachines.length} machine(s):`);
+    for (const m of perMachineServices) {
+      onLog?.(`  • ${m.machineKey} — app-device:${m.services['app-device-interface'].port} validation:${m.services['validation-engine'].port} tcp:${m.tcpPort}`);
+    }
+    onLog?.(`[ORCHESTRATOR] Shared services — incoming:${sharedServices['incoming-service'].port} mapper:${sharedServices['mapper-service'].port} dataposting:${sharedServices['dataposting-service'].port} bff:${sharedServices['backend-for-frontend'].port}`);
 
     try {
       onLog?.(`[ORCHESTRATOR] Instructing VM to spawn microservices...`);
       await emitToInfraWithAck('infra:spawn-services', {
-        sessionId, mongoUri: this.testDbUri, dbName,
+        sessionId,
+        mongoUri: this.testDbUri,
+        dbName,
+
+        // ── Legacy single-machine fields (kept for backward compat) ────────
         machineId: selectedMachine?.id || '',
         machineKey: (selectedMachine as any)?.machine_key || 'MA01',
+
+        // ── New multi-machine fields ───────────────────────────────────────
+        // The infra-node should iterate `machines` to spawn per-machine services
+        // and use `sharedServices` to spawn shared services once.
+        machines: perMachineServices,
+        sharedServices,
+        totalMachines: activeMachines.length,
       }, 900000);
       onLog?.(`[ORCHESTRATOR] VM services are up.`);
     } catch (e: any) {
@@ -583,6 +641,49 @@ export class Orchestrator {
     const failed = results.filter(r => !r.passed).length;
     onLog?.(`[ORCHESTRATOR] ✅ Tests complete: ${passed} passed, ${failed} failed`);
 
+    // ── Failure analysis ───────────────────────────────────────────────────
+    if (failed > 0) {
+      onProgress?.('Analyzing Failures', 93);
+      onLog?.(`[AI] Analyzing ${failed} failure(s)...`);
+
+      try {
+        const failedResults = results.filter(r => !r.passed);
+        const insights = await this.llama.analyzeFailures(failedResults);
+
+        for (const insight of insights) {
+          onLog?.(`[AI] ❌ ${insight.testId} (${insight.scenario})`);
+          onLog?.(`     Sort code: expected=${insight.expectedSortCode} actual=${insight.actualSortCode}`);
+          onLog?.(`     Root cause: ${insight.rootCause}`);
+          onLog?.(`     Fix: ${insight.recommendation}`);
+          if (insight.affectedLayers.length > 0) {
+            onLog?.(`     Affected: ${insight.affectedLayers.join(', ')}`);
+          }
+        }
+
+        // updateAnalysis (upsert) — avoids duplicate _id error from saveAnalysis
+        await this.inspectraDb.updateAnalysis(sessionId, {
+          failureInsights: insights,
+          failureRecommendations: insights.map(
+            i => `${i.testId}: ${i.rootCause} → ${i.recommendation}`
+          ),
+        });
+
+        onLog?.(`[AI] ✅ Failure analysis saved (${insights.length} insight(s))`);
+
+        const { streamEvent } = await import('./index');
+        streamEvent('ALERT', {
+          type: 'failure_analysis',
+          sessionId,
+          insights,
+          summary: `${failed} test(s) failed — ${insights.length} root cause(s) identified`
+        });
+
+      } catch (e: any) {
+        onLog?.(`[WARNING] Failure analysis could not complete: ${e.message}`);
+      }
+    }
+
+    // ── Save results to disk ───────────────────────────────────────────────
     try {
       const runDir = path.join(this.workspacePath, 'runs', `run_${sessionId}`);
       if (!fs.existsSync(runDir)) fs.mkdirSync(runDir, { recursive: true });

@@ -165,18 +165,43 @@ socket.on('infra:spawn-services', async (data: {
   sessionId: string;
   mongoUri: string;
   dbName: string;
+  // Legacy single-machine fields
   machineId: string;
   machineKey: string;
+  // New multi-machine fields
+  machines?: Array<{
+    machineId: string;
+    machineKey: string;
+    machineName?: string;
+    tcpPort?: number;
+    services: Record<string, { port: number }>;
+  }>;
+  sharedServices?: Record<string, { port: number }>;
+  totalMachines?: number;
 }, callback: Function) => {
   logger.info(`Received infra:spawn-services for session ${data.sessionId}`);
+
+  if (data.machines && data.machines.length > 0) {
+    logger.info(`[SPAWNER] Multi-machine mode: ${data.machines.length} machine(s)`);
+    for (const m of data.machines) {
+      const ports = Object.entries(m.services).map(([k, v]) => `${k}:${v.port}`).join(', ');
+      logger.info(`  • ${m.machineKey} (${m.machineId}) — ${ports}`);
+    }
+  } else {
+    logger.info(`[SPAWNER] Single-machine mode: ${data.machineKey} (${data.machineId})`);
+  }
 
   const result = await ServiceSpawner.spawnAll({
     bePath: '/data/NIDOWORKZ/CSND',
     sessionId: data.sessionId,
     mongoUri: data.mongoUri,
     dbName: data.dbName,
+    // Legacy fields (still needed for fallback path in spawnAll)
     machineId: data.machineId,
     machineKey: data.machineKey,
+    // New multi-machine fields
+    machines: data.machines,
+    sharedServices: data.sharedServices,
     onLog: (msg: string) => {
       logger.info(msg);
       socket.emit('infra:log', { message: msg });

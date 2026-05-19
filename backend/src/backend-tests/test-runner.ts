@@ -6,7 +6,7 @@ import { BackendValidator, ValidationResult } from './validator';
 import { UIValidator } from '../frontend-tests/ui-validator';
 import { InspectraDB } from '../core/inspectra-db';
 import { logger } from '../core/logger';
-import { DbSummary } from '../core/db-analyzer';
+import { DbSummary, MachineInfo } from '../core/db-analyzer';
 
 export interface SimulationResult {
   trackingId: string;
@@ -39,18 +39,16 @@ function extractResponses(sim: SimulationResult): {
   };
 }
 
-// ── Extract the 4-letter sort code from a PB response string ──────────────────
+// ── Extract the 4-letter sort code from a PB response string ─────────────────
 //
 // PB response format: "MA01,1831,PB,1001,1003,SUCC"
 //                                               ^^^^  ← last comma-segment
-// Covers: SUCC, DNFR, IBAR, DUPR, DBAR, GIFR, SBRR, etc.
 // Returns null if the response is empty or unparseable.
 
 function extractSortCode(pbResponse: string): string | null {
   if (!pbResponse) return null;
   const parts = pbResponse.trim().split(',');
   const last = parts[parts.length - 1]?.trim();
-  // Must be exactly 4 uppercase letters
   return last && /^[A-Z]{4}$/.test(last) ? last : null;
 }
 
@@ -114,11 +112,14 @@ export class TestRunner {
   }
 
   // ─────────────────────────────────────────────────────────────
-  // Wait for TCP Port
+  // Wait for a single TCP port
   // ─────────────────────────────────────────────────────────────
   private async waitForPort(
-    host: string, port: number, timeoutMs = 60000, intervalMs = 1000,
-    label = `${host}:${port}`, onLog?: (msg: string) => void
+    host: string, port: number,
+    timeoutMs = 120000,   // ← increased from 60000
+    intervalMs = 2000,    // ← poll every 2s instead of 1s (less noise)
+    label = `${host}:${port}`,
+    onLog?: (msg: string) => void
   ): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     let attempt = 0;
@@ -127,28 +128,71 @@ export class TestRunner {
       attempt++;
       const ready = await new Promise<boolean>((resolve) => {
         const sock = new net.Socket();
-        const timer = setTimeout(() => { sock.destroy(); resolve(false); }, 1000);
+        const timer = setTimeout(() => { sock.destroy(); resolve(false); }, 1500);
         sock.connect(port, host, () => { clearTimeout(timer); sock.destroy(); resolve(true); });
         sock.on('error', () => { clearTimeout(timer); resolve(false); });
       });
 
-      if (ready) { onLog?.(`  [READY] ${label} is up (attempt ${attempt})`); return; }
-      if (attempt % 5 === 0) {
-        onLog?.(`  [WAIT] ${label} not ready yet... (${Math.round((deadline - Date.now()) / 1000)}s left)`);
+      if (ready) {
+        onLog?.(`  [READY] ${label} is up (attempt ${attempt})`);
+        return;
       }
+
+      // Log every 30s so output isn't spammy for 8 machines × 2 services = 16 streams
+      const remaining = Math.round((deadline - Date.now()) / 1000);
+      if (attempt === 1 || remaining % 30 === 0) {
+        onLog?.(`  [WAIT] ${label} not ready (${remaining}s left)`);
+      }
+
       await this.sleep(intervalMs);
     }
     throw new Error(`Timeout waiting for ${label}`);
   }
 
   // ─────────────────────────────────────────────────────────────
-  // Wait For All Services
+  // Wait for ALL machines' per-machine services
+  //
+  // All ports checked in parallel (Promise.all).
+  // Duplicate ports deduplicated so we don't double-wait.
+  // Timeout: 120s per port (set above).
   // ─────────────────────────────────────────────────────────────
-  private async waitForAllServices(onLog?: (msg: string) => void): Promise<void> {
+  private async waitForAllServices(
+    machines: MachineInfo[],
+    onLog?: (msg: string) => void
+  ): Promise<void> {
     onLog?.('  [STARTUP] Waiting for all services to be ready...');
     const vmHost = this.resolveVmHost();
-    await this.waitForPort(vmHost, 5500, 60000, 1000, `app-device-interface ${vmHost}:5500`, onLog);
-    await this.waitForPort(vmHost, 5000, 60000, 1000, `validation-engine ${vmHost}:5000`, onLog);
+    const activeMachines = machines.filter(m => m.status);
+
+    onLog?.(`  [STARTUP] Checking ${activeMachines.length} machine(s) × 2 ports = ${activeMachines.length * 2} checks (parallel)`);
+
+    const checks: Array<{ label: string; port: number }> = [];
+    for (const machine of activeMachines) {
+      checks.push({
+        label: `app-device-interface [${machine.machine_key}] ${vmHost}:${machine.appDevicePort}`,
+        port: machine.appDevicePort,
+      });
+      checks.push({
+        label: `validation-engine [${machine.machine_key}] ${vmHost}:${machine.validationEnginePort}`,
+        port: machine.validationEnginePort,
+      });
+    }
+
+    // Deduplicate by port
+    const seen = new Set<number>();
+    const uniqueChecks = checks.filter(c => {
+      if (seen.has(c.port)) return false;
+      seen.add(c.port);
+      return true;
+    });
+
+    // All checks run in parallel — Promise.all throws on first failure
+    await Promise.all(
+      uniqueChecks.map(({ label, port }) =>
+        this.waitForPort(vmHost, port, 120000, 2000, label, onLog)
+      )
+    );
+
     onLog?.('  [STARTUP] Ports open — waiting 3s...');
     await this.sleep(3000);
     onLog?.('  [STARTUP] ✅ All services ready.');
@@ -169,13 +213,14 @@ export class TestRunner {
     if (!fs.existsSync(screenshotsDir)) fs.mkdirSync(screenshotsDir, { recursive: true });
 
     onLog?.(`[TEST-RUNNER] Starting ${testCases.length} test cases`);
-    await this.waitForAllServices(onLog);
+
+    // Wait for all per-machine services before starting any test
+    await this.waitForAllServices(dbSummary.machines, onLog);
 
     const results: TestResult[] = [];
 
     for (const tc of testCases) {
       onLog?.(`[TEST-RUNNER] ▶ Running ${tc.testId}: ${tc.description}`);
-
       const result = await this.runSingle(tc, sessionId, dbSummary, screenshotsDir, onLog);
       results.push(result);
 
@@ -222,16 +267,27 @@ export class TestRunner {
   ): Promise<TestResult> {
 
     const startTime = Date.now();
-    const tcpPort = 3000;
     const vmHost = this.resolveVmHost();
     const barcode = tc.barcode || this.generateBarcode();
 
-    const machine =
-      dbSummary.machines.find(m => m.id === tc.machineId || (m as any).machine_key === tc.machineName)
-      || dbSummary.machines[0];
+    // ── Resolve the machine for this test case ────────────────────────────
+    // Match by machineId first, then by machine_key (machineName field stores machine_key)
+    const machine: MachineInfo =
+      dbSummary.machines.find(m => m.id === tc.machineId) ||
+      dbSummary.machines.find(m => m.machine_key === tc.machineName) ||
+      dbSummary.machines[0];
 
     const machineName = machine?.name || 'Unknown';
-    const machineKey = tc.machineName || (machine as any)?.machine_key || 'MA01';
+    const machineKey = tc.machineName || machine?.machine_key || 'MA01';
+
+    // ── Per-machine ports ─────────────────────────────────────────────────
+    // tcpPort:    the TCP server port the scanner/PLC connects to on the VM
+    //             → this is what PB/PD/PC packets are sent to
+    //             → each machine has its own port (e.g. MA01=3001, MA02=3002)
+    // appDevicePort / validationEnginePort: used for health checks (already done)
+    const tcpPort = machine?.tcpPort ?? 3000;
+
+    onLog?.(`  [MACHINE] ${machineKey} | TCP:${tcpPort} | appDevice:${machine?.appDevicePort} | validation:${machine?.validationEnginePort}`);
 
     let simulation: SimulationResult | null = null;
     let validation: ValidationResult | null = null;
@@ -245,7 +301,7 @@ export class TestRunner {
       const dims = tc.dims ?? { l: 187, b: 172, h: 47 };
       const weight = tc.weight ?? 0.12;
 
-      // ─── DUPLICATE TEST (DUPR) ─────────────────────────────────────────────
+      // ─── DUPLICATE TEST (DUPR) ─────────────────────────────────────────
       if (tc.isDuplicate) {
         const secondRaw = await simulateOnInfra({
           barcode: tc.barcode,
@@ -262,15 +318,11 @@ export class TestRunner {
         const { pbResponse, pdResponse, pcResponse } = extractResponses(second);
         onLog?.(`  [PHASE 1] PB:${pbResponse} PD:${pdResponse} PC:${pcResponse}`);
 
-        // ── SOURCE OF TRUTH: sort code from TCP response ────────────────────
         const actualSortCode = extractSortCode(pbResponse);
         const expectedSortCode = tc.expectedSortCode ?? 'DUPR';
-
         onLog?.(`  [SORT-CODE] expected=${expectedSortCode} actual=${actualSortCode ?? 'UNKNOWN'}`);
 
         await this.sleep(6000);
-
-        // Validator and UI are trace/reporting only — do NOT affect passed
         validation = await validator.validateParcel(barcode, 10, 2000);
 
         try {
@@ -284,25 +336,13 @@ export class TestRunner {
           uiResult = { found: false, error: uiErr.message, status: 'ERROR' };
         }
 
-        // ── PASS/FAIL: sort code match only ────────────────────────────────
         const passed = actualSortCode === expectedSortCode;
-        // actualStatus reflects what the machine did:
-        //   expectedSortCode SUCC → machine sorted → PASS
-        //   anything else → machine rejected → FAIL
-        const actualStatus: 'PASS' | 'FAIL' =
-          actualSortCode === 'SUCC' ? 'PASS' : 'FAIL';
+        const actualStatus: 'PASS' | 'FAIL' = actualSortCode === 'SUCC' ? 'PASS' : 'FAIL';
 
         return {
-          testId: tc.testId,
-          scenario: tc.scenario,
-          barcode,
-          machineName,
-          expectedStatus: tc.expectedStatus,
-          actualStatus,
-          passed,
-          simulation,
-          validation,
-          uiResult,
+          testId: tc.testId, scenario: tc.scenario, barcode, machineName,
+          expectedStatus: tc.expectedStatus, actualStatus, passed,
+          simulation, validation, uiResult,
           durationMs: Date.now() - startTime,
           screenshotPath: uiResult?.screenshotPath,
           reason: passed
@@ -311,11 +351,11 @@ export class TestRunner {
         };
       }
 
-      // ─── NORMAL TEST ───────────────────────────────────────────────────────
+      // ─── NORMAL TEST ───────────────────────────────────────────────────
       const simRaw = await simulateOnInfra({
         barcode, machineKey, dims, weight,
         edgeProfile: 'NORMAL',
-        options: { host: vmHost, port: tcpPort },
+        options: { host: vmHost, port: tcpPort },  // ← per-machine TCP port
       });
 
       simulation = simRaw as unknown as SimulationResult;
@@ -323,33 +363,20 @@ export class TestRunner {
       const { pbResponse, pdResponse, pcResponse } = extractResponses(simulation);
       onLog?.(`  [PHASE 1] PB:${pbResponse} PD:${pdResponse} PC:${pcResponse}`);
 
-      // ── SOURCE OF TRUTH: sort code from TCP PB response ───────────────────
-      //
-      // This is the only thing that determines pass/fail.
-      // The validator (DB check) and UI check are supplementary trace data.
-      //
-      // Examples:
-      //   tc.expectedSortCode = "SUCC"  → machine must return SUCC  → passed
-      //   tc.expectedSortCode = "DNFR"  → machine must return DNFR  → passed
-      //   tc.expectedSortCode = "IBAR"  → machine returns DNFR      → failed
-      //   tc.expectedSortCode = "DUPR"  → handled above in isDuplicate branch
-
+      // ── SOURCE OF TRUTH: sort code from TCP PB response ───────────────
       const actualSortCode = extractSortCode(pbResponse);
       const expectedSortCode = tc.expectedSortCode;
-
       onLog?.(`  [SORT-CODE] expected=${expectedSortCode ?? 'N/A'} actual=${actualSortCode ?? 'UNKNOWN'}`);
 
       await this.sleep(6000);
 
-      // ── Validator — trace only, does NOT affect passed ─────────────────────
+      // Validator and UI are trace-only — do NOT affect passed
       validation = await validator.validateParcel(barcode, 10, 2000);
 
-      // ── UI — trace only, does NOT affect passed ────────────────────────────
       try {
         uiResult = await this.uiValidator.validateParcelDisplay(
           `http://${process.env.VM_HOST}:7001/CL0003/master_search.php`,
           barcode, sessionId, (tc as any).commitId || 'latest',
-          // Pass the actual outcome to UI validator so it knows what to expect
           { status: actualSortCode === 'SUCC' ? 'PASS' : 'FAIL' },
           screenshotsDir
         );
@@ -357,23 +384,19 @@ export class TestRunner {
         uiResult = { found: false, error: uiErr.message, status: 'ERROR' };
       }
 
-      // ── PASS/FAIL: sort code match only ────────────────────────────────────
-      //
-      // If tc has no expectedSortCode (legacy test cases), fall back to the
-      // old expectedStatus vs actualStatus comparison so nothing breaks.
+      // ── PASS/FAIL: sort code match only ────────────────────────────────
       let passed: boolean;
       let actualStatus: 'PASS' | 'FAIL';
       let reason: string;
 
       if (expectedSortCode) {
-        // New path: compare sort codes from TCP response
         passed = actualSortCode === expectedSortCode;
         actualStatus = actualSortCode === 'SUCC' ? 'PASS' : 'FAIL';
         reason = passed
           ? `${expectedSortCode} ✅`
           : `expected ${expectedSortCode} → got ${actualSortCode ?? 'UNKNOWN'} ❌`;
       } else {
-        // Legacy fallback: use validator.overallPass (old behaviour)
+        // Legacy fallback: use validator.overallPass
         const rejectionCode = simulation?.rejectionCode
           || simulation?.steps.find(s => s.type === 'PB')?.response?.match(/,([A-Z]{4})\s/)?.[1]
           || null;
@@ -384,7 +407,7 @@ export class TestRunner {
           : `Expected ${tc.expectedStatus} → Got ${actualStatus} ❌${rejectionCode ? ` (${rejectionCode})` : ''}`;
       }
 
-      // ── UI note (informational only) ────────────────────────────────────────
+      // ── UI note (informational only) ────────────────────────────────────
       const uiRejectionCode = uiResult?.displayedRejectionCode || null;
       const uiDisplayedStatus = uiResult?.displayedStatus || null;
       let uiNote = '';
@@ -406,16 +429,9 @@ export class TestRunner {
       if (uiNote) reason += ` | UI: ${uiNote}`;
 
       return {
-        testId: tc.testId,
-        scenario: tc.scenario,
-        barcode,
-        machineName,
-        expectedStatus: tc.expectedStatus,
-        actualStatus,
-        passed,
-        simulation,
-        validation,
-        uiResult,
+        testId: tc.testId, scenario: tc.scenario, barcode, machineName,
+        expectedStatus: tc.expectedStatus, actualStatus, passed,
+        simulation, validation, uiResult,
         durationMs: Date.now() - startTime,
         screenshotPath: uiResult?.screenshotPath,
         reason,
@@ -424,16 +440,9 @@ export class TestRunner {
     } catch (err: any) {
       logger.error(`[TEST-RUNNER] ${tc.testId} crashed: ${err.message}`, 'TEST-RUNNER');
       return {
-        testId: tc.testId,
-        scenario: tc.scenario,
-        barcode,
-        machineName,
-        expectedStatus: tc.expectedStatus,
-        actualStatus: 'ERROR',
-        passed: false,
-        simulation,
-        validation,
-        uiResult,
+        testId: tc.testId, scenario: tc.scenario, barcode, machineName,
+        expectedStatus: tc.expectedStatus, actualStatus: 'ERROR', passed: false,
+        simulation, validation, uiResult,
         durationMs: Date.now() - startTime,
         error: err.message,
       };
