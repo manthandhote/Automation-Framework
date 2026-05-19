@@ -7,6 +7,7 @@ import { UIValidator } from '../frontend-tests/ui-validator';
 import { InspectraDB } from '../core/inspectra-db';
 import { logger } from '../core/logger';
 import { DbSummary, MachineInfo } from '../core/db-analyzer';
+import { emitToInfraWithAck } from '../index';
 
 export interface SimulationResult {
   trackingId: string;
@@ -285,6 +286,7 @@ export class TestRunner {
     //             → this is what PB/PD/PC packets are sent to
     //             → each machine has its own port (e.g. MA01=3001, MA02=3002)
     // appDevicePort / validationEnginePort: used for health checks (already done)
+    const isCsnd = (machine as any).isCsnd === true;
     const tcpPort = machine?.tcpPort ?? 3000;
 
     onLog?.(`  [MACHINE] ${machineKey} | TCP:${tcpPort} | appDevice:${machine?.appDevicePort} | validation:${machine?.validationEnginePort}`);
@@ -296,7 +298,11 @@ export class TestRunner {
     const validator = new BackendValidator(this.mongoUri);
 
     try {
-      onLog?.(`  [TCP] Connecting to ${vmHost}:${tcpPort}`);
+      if (isCsnd) {
+        onLog?.(`  [CSND] Profiling machine — HTTP + Modbus RTU path`);
+      } else {
+        onLog?.(`  [TCP] Connecting to ${vmHost}:${tcpPort}`);
+      }
 
       const dims = tc.dims ?? { l: 187, b: 172, h: 47 };
       const weight = tc.weight ?? 0.12;
@@ -352,60 +358,171 @@ export class TestRunner {
       }
 
       // ─── NORMAL TEST ───────────────────────────────────────────────────
-      const simRaw = await simulateOnInfra({
-        barcode, machineKey, dims, weight,
-        edgeProfile: 'NORMAL',
-        options: { host: vmHost, port: tcpPort },  // ← per-machine TCP port
-      });
+      // ─── CSND MACHINE — HTTP barcode + Modbus RTU ──────────────────────
+      let actualSortCode: string | null = null;
+      let expectedSortCode: string | undefined = undefined;
+      let passed = false;
+      let actualStatus: 'PASS' | 'FAIL' = 'FAIL';
+      let reason = 'No reason captured';
+      if (isCsnd) {
+        onLog?.(`  [CSND] CSND machine detected — using HTTP+Modbus path`);
 
-      simulation = simRaw as unknown as SimulationResult;
+        const csndRaw = await emitToInfraWithAck('infra:simulate-cycle-csnd', {
+          barcode,
+          machineId: machine.id,
+          machineKey,
+          appDeviceHost: vmHost,
+          appDevicePort: machine.appDevicePort,
+          mongoUri: this.mongoUri,
+          timeoutMs: 15000,
+        }, 30000);
 
-      const { pbResponse, pdResponse, pcResponse } = extractResponses(simulation);
-      onLog?.(`  [PHASE 1] PB:${pbResponse} PD:${pdResponse} PC:${pcResponse}`);
+  const csndResult = csndRaw.result;
 
-      // ── SOURCE OF TRUTH: sort code from TCP PB response ───────────────
-      const actualSortCode = extractSortCode(pbResponse);
-      const expectedSortCode = tc.expectedSortCode;
-      onLog?.(`  [SORT-CODE] expected=${expectedSortCode ?? 'N/A'} actual=${actualSortCode ?? 'UNKNOWN'}`);
+  simulation = {
+    trackingId: barcode,
+    barcode,
+    machineKey,
+    steps: [],
+    finalStatus: csndResult.finalStatus === 'SORTED'
+      ? 'SORTED'
+      : csndResult.finalStatus === 'REJECTED'
+        ? 'REJECTED_PB'
+        : 'ERROR',
+    rejectionCode: csndResult.rejectionCode || undefined,
+    durationMs: csndResult.durationMs,
+  };
 
-      await this.sleep(6000);
+  actualSortCode =
+    csndResult.rejectionCode ||
+    (csndResult.finalStatus === 'SORTED' ? 'SUCC' : null);
 
-      // Validator and UI are trace-only — do NOT affect passed
-      validation = await validator.validateParcel(barcode, 10, 2000);
+  expectedSortCode = tc.expectedSortCode;
 
-      try {
-        uiResult = await this.uiValidator.validateParcelDisplay(
-          `http://${process.env.VM_HOST}:7001/CL0003/master_search.php`,
-          barcode, sessionId, (tc as any).commitId || 'latest',
-          { status: actualSortCode === 'SUCC' ? 'PASS' : 'FAIL' },
-          screenshotsDir
-        );
-      } catch (uiErr: any) {
-        uiResult = { found: false, error: uiErr.message, status: 'ERROR' };
-      }
+  onLog?.(
+    `  [CSND] finalStatus=${csndResult.finalStatus} rejectionCode=${csndResult.rejectionCode ?? 'none'}`
+  );
 
-      // ── PASS/FAIL: sort code match only ────────────────────────────────
-      let passed: boolean;
-      let actualStatus: 'PASS' | 'FAIL';
-      let reason: string;
+  await this.sleep(3000);
 
-      if (expectedSortCode) {
-        passed = actualSortCode === expectedSortCode;
-        actualStatus = actualSortCode === 'SUCC' ? 'PASS' : 'FAIL';
-        reason = passed
-          ? `${expectedSortCode} ✅`
-          : `expected ${expectedSortCode} → got ${actualSortCode ?? 'UNKNOWN'} ❌`;
-      } else {
-        // Legacy fallback: use validator.overallPass
-        const rejectionCode = simulation?.rejectionCode
-          || simulation?.steps.find(s => s.type === 'PB')?.response?.match(/,([A-Z]{4})\s/)?.[1]
-          || null;
-        actualStatus = validation.overallPass && !rejectionCode ? 'PASS' : 'FAIL';
-        passed = actualStatus === tc.expectedStatus;
-        reason = passed
-          ? `Expected ${tc.expectedStatus} → Got ${actualStatus} ✅`
-          : `Expected ${tc.expectedStatus} → Got ${actualStatus} ❌${rejectionCode ? ` (${rejectionCode})` : ''}`;
-      }
+  validation = await validator.validateParcel(barcode, 10, 2000);
+
+  try {
+    uiResult = await this.uiValidator.validateParcelDisplay(
+      `http://${process.env.VM_HOST}:7001/CL0003/master_search.php`,
+      barcode,
+      sessionId,
+      (tc as any).commitId || 'latest',
+      { status: actualSortCode === 'SUCC' ? 'PASS' : 'FAIL' },
+      screenshotsDir
+    );
+  } catch (uiErr: any) {
+    uiResult = {
+      found: false,
+      error: uiErr.message,
+      status: 'ERROR'
+    };
+  }
+
+
+
+  if (expectedSortCode) {
+    passed = actualSortCode === expectedSortCode;
+
+    actualStatus =
+      actualSortCode === 'SUCC' ? 'PASS' : 'FAIL';
+
+    reason = passed
+      ? `${expectedSortCode} ✅`
+      : `expected ${expectedSortCode} → got ${actualSortCode ?? 'UNKNOWN'} ❌`;
+  } else {
+    actualStatus =
+      csndResult.finalStatus === 'SORTED'
+        ? 'PASS'
+        : 'FAIL';
+
+    passed = actualStatus === tc.expectedStatus;
+
+    reason = passed
+      ? `${actualStatus} ✅`
+      : `expected ${tc.expectedStatus} → got ${actualStatus} ❌`;
+  }
+}
+
+// ─── TCP SORTER — existing path ────────────────────────────────────
+else {
+  const simRaw = await simulateOnInfra({
+    barcode,
+    machineKey,
+    dims,
+    weight,
+    edgeProfile: 'NORMAL',
+    options: { host: vmHost, port: tcpPort },
+  });
+
+  simulation = simRaw as unknown as SimulationResult;
+
+  const { pbResponse, pdResponse, pcResponse } = extractResponses(simulation);
+
+  onLog?.(`  [PHASE 1] PB:${pbResponse} PD:${pdResponse} PC:${pcResponse}`);
+
+  actualSortCode = extractSortCode(pbResponse);
+  expectedSortCode = tc.expectedSortCode;
+
+  onLog?.(
+    `  [SORT-CODE] expected=${expectedSortCode ?? 'N/A'} actual=${actualSortCode ?? 'UNKNOWN'}`
+  );
+
+  await this.sleep(6000);
+
+  validation = await validator.validateParcel(barcode, 10, 2000);
+
+  try {
+    uiResult = await this.uiValidator.validateParcelDisplay(
+      `http://${process.env.VM_HOST}:7001/CL0003/master_search.php`,
+      barcode,
+      sessionId,
+      (tc as any).commitId || 'latest',
+      { status: actualSortCode === 'SUCC' ? 'PASS' : 'FAIL' },
+      screenshotsDir
+    );
+  } catch (uiErr: any) {
+    uiResult = {
+      found: false,
+      error: uiErr.message,
+      status: 'ERROR'
+    };
+  }
+
+  if (expectedSortCode) {
+    passed = actualSortCode === expectedSortCode;
+
+    actualStatus =
+      actualSortCode === 'SUCC' ? 'PASS' : 'FAIL';
+
+    reason = passed
+      ? `${expectedSortCode} ✅`
+      : `expected ${expectedSortCode} → got ${actualSortCode ?? 'UNKNOWN'} ❌`;
+  } else {
+    const rejectionCode =
+      simulation?.rejectionCode ||
+      simulation?.steps
+        .find(s => s.type === 'PB')
+        ?.response?.match(/,([A-Z]{4})\s/)?.[1] ||
+      null;
+
+    actualStatus =
+      validation.overallPass && !rejectionCode
+        ? 'PASS'
+        : 'FAIL';
+
+    passed = actualStatus === tc.expectedStatus;
+
+    reason = passed
+      ? `Expected ${tc.expectedStatus} → Got ${actualStatus} ✅`
+      : `Expected ${tc.expectedStatus} → Got ${actualStatus} ❌${rejectionCode ? ` (${rejectionCode})` : ''}`;
+  }
+}
 
       // ── UI note (informational only) ────────────────────────────────────
       const uiRejectionCode = uiResult?.displayedRejectionCode || null;

@@ -25,6 +25,7 @@ const BARCODE_DESTINATION_COLUMNS = [
     'shipment_no',
     'parcel_id',
     'consignment_id',
+    
 ];
 
 export class IncomingDataSeeder {

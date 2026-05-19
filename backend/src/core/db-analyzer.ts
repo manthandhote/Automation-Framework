@@ -1,9 +1,5 @@
 import { MongoClient } from 'mongodb';
-import { exec } from 'child_process';
-import util from 'util';
 import { logger } from './logger';
-
-const execPromise = util.promisify(exec);
 
 export interface MachineInfo {
   id: string;
@@ -14,6 +10,16 @@ export interface MachineInfo {
   status: boolean;
   configCount: number;
   configs: IncomingConfigInfo[];
+  isCsnd: boolean;
+  modbusConnections?: Array<{
+  connectionId: number;
+  slaveId: number;
+  registerAddress: number;
+  portName: string;
+}>;
+  devices?: Array<{ device_id?: number; data?: string; connection_id?: number | string }>;
+  machineServicesConfig?: Record<string, any>;
+  deviceConfig?: any;
 
   // ── Port info extracted from machine doc ─────────────────────────────────
   // tcpPort:              device_config.connection_pools[barcode device].port_name
@@ -111,6 +117,20 @@ export class DbAnalyzer {
           svcConfig['app-device-interface']?.port || 5500;
         const validationEnginePort: number =
           svcConfig['validation-engine']?.port || 5000;
+        const machineType = (m.machine_type || '').toUpperCase();
+        const isCsnd = machineType === 'CSND' ||
+          (m.device_config?.connection_pools || []).some((cp: any) => cp.type === 'Modbus');
+
+        const modbusConnections = isCsnd
+          ? (m.device_config?.connection_pools || [])
+              .filter((cp: any) => cp.type === 'Modbus')
+              .map((cp: any) => ({
+                connectionId: cp.connection_id,
+                slaveId: cp.slave_id,
+                registerAddress: cp.register_address || 0,
+                portName: cp.port_name,
+              }))
+          : [];
 
         logger.info(
           `[DIAGNOSTIC] Machine ${name} (${id}) — TCP:${tcpPort} appDevice:${appDevicePort} validation:${validationEnginePort}`,
@@ -129,6 +149,11 @@ export class DbAnalyzer {
           tcpPort,
           appDevicePort,
           validationEnginePort,
+          isCsnd,
+          modbusConnections,
+          devices: m.device_config?.devices || [],
+          machineServicesConfig: svcConfig,
+          deviceConfig: m.device_config,
         });
 
         if (m.client_name) clients.add(m.client_name);
@@ -174,6 +199,7 @@ export class DbAnalyzer {
           id: '', name: 'unknown', machine_key: 'unknown', type: 'sorter',
           location: 'unknown', status: true, configCount: 0, configs: [],
           tcpPort: 3000, appDevicePort: 5500, validationEnginePort: 5000,
+          isCsnd: false,
         }];
       }
 

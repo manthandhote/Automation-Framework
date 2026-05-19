@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import { socket } from '../socket';
-import { Send, GitBranch, Upload, Loader, Bot, User, Database, Cpu, CheckCircle } from 'lucide-react';
+import { Send, GitBranch, Bot, User, Database, CheckCircle } from 'lucide-react';
 
 const API_BASE = 'http://localhost:4200';
 
@@ -73,10 +73,8 @@ export function SetupChat() {
   const [isTyping, setIsTyping] = useState(false);
   const [_beBranches, setBeBranches] = useState<string[]>([]);
   const [_feBranches, setFeBranches] = useState<string[]>([]);
-  const [sessionId, setSessionId] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [progress, setProgress] = useState<{ step: string; percent: number } | null>(null);
-  const [_result, setResult] = useState<any>(null);
 
   const [setup, setSetup] = useState<SetupState>({
     clientName: '', machineDescriptions: '',
@@ -153,7 +151,6 @@ export function SetupChat() {
     try {
       const res = await axios.post(`${API_BASE}/api/setup`, { ...updatedSetup, machineIds });
       const sid = res.data.sessionId;
-      setSessionId(sid);
       setProgress(null);
       setTimeout(async () => {
         try {
@@ -326,10 +323,10 @@ export function SetupChat() {
         dbRepoUrl: repoUrl,
         dbClientFolder: clientFolder,
       });
-      const machines: string[] = analysisRes.data.machines || [];
+      const machines: { id: string; name: string }[] = analysisRes.data.machines || [];
 
       if (machines.length === 0) {
-        addSysMessage('⚠️ No machines found. You can enter them manually:', <MachineSelector onConfirm={handleMachineConfirm} />);
+        addSysMessage('⚠️ No machines found. You can enter them manually:', <MachineSelector onConfirm={(desc) => handleMachineConfirm(desc, [])} />);
       } else {
         addSysMessage(
           `✅ Discovered **${machines.length} machines** in your database:`,

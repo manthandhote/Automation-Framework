@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, AreaChart, Area, CartesianGrid } from 'recharts';
-import { Download, CheckCircle, XCircle, AlertTriangle, FileText, ChevronRight, Zap } from 'lucide-react';
+import { Download, AlertTriangle, FileText, Zap } from 'lucide-react';
 
 const API_BASE = 'http://localhost:4200';
 
@@ -87,7 +87,7 @@ export const ExecutionReport = () => {
     </div>
   );
 
-  const { execution, infra, performance, root_causes } = report;
+  const { execution, root_causes } = report;
   const { summary, steps } = execution || { summary: { total: 0, pass: 0, fail: 0, healed: 0 }, steps: [] };
 
   const chartData = [

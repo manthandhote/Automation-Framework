@@ -75,8 +75,8 @@ export class UIValidator {
         // Already logged in (session cookie still alive) — skip login
         logger.info(`[UI-VALIDATOR] Already authenticated, skipping login.`, 'UI-VALIDATOR');
       } else {
-        await page.fill('input[name="username"]', process.env.FE_USERNAME || 'adminuser');
-        await page.fill('input[name="password"]', process.env.FE_PASSWORD || 'Nido@2023');
+        await page.fill('input[name="username"]', process.env.FE_USERNAME || 'nidoadmin');
+        await page.fill('input[name="password"]', process.env.FE_PASSWORD || 'Nido@46yegh2026');
         await Promise.all([
           page.waitForURL(/dashboard/, { timeout: 20000 }),
           page.click('button[name="login"]')

@@ -251,7 +251,7 @@ export class ServiceSpawner {
                 continue;
             }
 
-            const port = sharedServicePorts[svc.configKey];
+            const port = sharedServicePorts[svc.name];
             if (!port) {
                 onLog(`[SPAWNER] ⚠️  No port for shared service ${svc.name} — skipping`);
                 continue;

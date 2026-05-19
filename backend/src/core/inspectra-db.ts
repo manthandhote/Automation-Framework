@@ -16,6 +16,8 @@ export interface Session {
   feBranch: string;
   codeDir: string;
   dbBackupPath?: string;
+  dbRepoUrl?: string;
+  dbClientFolder?: string;
   restoredDbName?: string;
   machineIds?: string[];
   beCommit?: string;
@@ -71,6 +73,8 @@ export interface AiAnalysis {
   scalingPlan: any;
   recommendations: string[];
   failureAnalysis?: string[];
+  failureInsights?: string[];
+  failureRecommendations?: string[];
   generatedAt: Date;
 }
 

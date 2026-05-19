@@ -16,7 +16,6 @@ const API_BASE = `http://localhost:4200`;
 const App = () => {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
-  const [health, setHealth] = useState<any[]>([]);
   const [infraStatus, setInfraStatus] = useState<any>(null);
   const [logs, setLogs] = useState<{ data: string, timestamp: string }[]>([]);
   const [selectedProtocol, setSelectedProtocol] = useState<'capella' | 'astro'>('capella');
@@ -34,7 +33,6 @@ const App = () => {
   useEffect(() => {
     socket.on('system:init', (data) => {
       if (Array.isArray(data.health)) {
-        setHealth(data.health);
         const map: Record<string, string> = {};
         data.health.forEach((h: any) => {
           // Only update if the backend reports UP, or if we don't have a status yet

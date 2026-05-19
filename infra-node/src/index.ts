@@ -22,7 +22,84 @@ const socket: Socket = io(ORCHESTRATOR_URL);
 const processManager = new ProcessManager();
 
 logger.info(`Connecting to AUTOMYRIX at ${ORCHESTRATOR_URL}...`);
+// ── Setup CSND virtual serial + Modbus RTU slaves ─────────────────────────
+socket.on('infra:setup-csnd', async (data: {
+  machineId: string;
+  machineKey: string;
+  connectionPools: Array<{
+    connection_id: number;
+    type: string;
+    port_name: string;
+    baud_rate: number;
+    slave_id: number;
+    register_address: number;
+  }>;
+  devices: Array<{ device_id: number; data: string; connection_id: number }>;
+  dimensionRegisters?: number[];
+  weightRegisters?: number[];
+}, callback: Function) => {
+  logger.info(`[CSND] Setting up Modbus RTU simulation for ${data.machineKey}`);
+  try {
+    const { ModbusSimulator } = await import('./modbus-simulator');
+    const sim = new ModbusSimulator((msg: string) => {
+      logger.info(msg);
+      socket.emit('infra:log', { message: msg });
+    });
 
+    if (data.dimensionRegisters) sim.setDimensionRegisters(data.dimensionRegisters);
+    if (data.weightRegisters) sim.setWeightRegisters(data.weightRegisters);
+
+    const portMap = await sim.setup(data.connectionPools, data.devices);
+
+    // Store for teardown
+    (global as any).__csndSims = (global as any).__csndSims || {};
+    (global as any).__csndSims[data.machineId] = sim;
+
+    logger.info(`[CSND] portMap: ${JSON.stringify(portMap)}`);
+    callback({ success: true, portMap });
+  } catch (err: any) {
+    logger.error(`[CSND] Setup failed: ${err.message}`);
+    callback({ success: false, error: err.message });
+  }
+});
+
+// ── Simulate CSND barcode cycle ───────────────────────────────────────────
+socket.on('infra:simulate-cycle-csnd', async (data: {
+  barcode: string;
+  machineId: string;
+  machineKey: string;
+  appDeviceHost: string;
+  appDevicePort: number;
+  mongoUri: string;
+  timeoutMs?: number;
+}, callback: Function) => {
+  logger.info(`[CSND] Simulating cycle: ${data.barcode} on ${data.machineKey}`);
+  try {
+    const { CsndSimulator } = await import('./csnd-simulator');
+    const sim = new CsndSimulator(
+      data.appDeviceHost,
+      data.appDevicePort,
+      data.mongoUri,
+      data.machineKey
+    );
+    const result = await sim.runCycle(data.barcode, data.machineId, data.timeoutMs ?? 15000);
+    callback({ success: true, result });
+  } catch (err: any) {
+    logger.error(`[CSND] Cycle failed: ${err.message}`);
+    callback({ success: false, error: err.message });
+  }
+});
+
+// ── Teardown CSND socat + RTU slaves ──────────────────────────────────────
+socket.on('infra:teardown-csnd', (data: { machineId: string }, callback: Function) => {
+  const sims = (global as any).__csndSims || {};
+  if (sims[data.machineId]) {
+    sims[data.machineId].teardown();
+    delete sims[data.machineId];
+    logger.info(`[CSND] Teardown complete for ${data.machineId}`);
+  }
+  if (callback) callback({ success: true });
+});
 socket.on('connect', async () => {
   logger.info('Connected to AUTOMYRIX Orchestrator.');
 

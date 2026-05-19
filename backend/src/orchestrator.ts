@@ -7,7 +7,7 @@ import { DbAnalyzer, DbSummary } from './core/db-analyzer';
 import { TestRunner } from './backend-tests/test-runner';
 import { E2ETestRunner, E2EReport } from './backend-tests/platform/e2e-test-runner';
 import { IncomingDataSeeder } from './core/incoming-data-seeder';  // ← NEW
-import { MongoClient } from 'mongodb';
+import { MongoClient, ObjectId } from 'mongodb';
 import { exec, ChildProcess } from 'child_process';
 import util from 'util';
 import path from 'path';
@@ -16,6 +16,14 @@ import { logger } from './core/logger';
 import { emitToInfra, emitToInfraWithAck } from './index';
 
 const execAsync = util.promisify(exec);
+
+function machineIdFilter(machineId: string) {
+  const filters: any[] = [{ _id: machineId }];
+  if (ObjectId.isValid(machineId)) {
+    filters.push({ _id: new ObjectId(machineId) });
+  }
+  return { $or: filters };
+}
 
 export interface ServiceInfo {
   name: string;
@@ -266,7 +274,7 @@ export class Orchestrator {
       if (!dbSummary) {
         dbSummary = {
           dbName: restoredDbName, totalMachines: 1, activeMachines: 1,
-          machines: [{ id: 'virtual-01', name: config.machineDescriptions || 'Default Machine', machine_key: 'MA01', type: 'sorter', location: 'Remote', status: true, configCount: 1, configs: [] }],
+          machines: [{ id: 'virtual-01', name: config.machineDescriptions || 'Default Machine', machine_key: 'MA01', type: 'sorter', location: 'Remote', status: true, configCount: 1, configs: [], isCsnd: false, tcpPort: 3000, appDevicePort: 5500, validationEnginePort: 5000 }],
           totalConfigs: 0, clients: [config.clientName], configTypes: {}
         };
       }
@@ -591,7 +599,7 @@ export class Orchestrator {
 
     // Shared services — read from selected machine config (same across all)
     // If machine_services_config is not present, fall back to defaults
-    const sharedMachineConfig = (selectedMachine as any)?.machine_services_config || {};
+    const sharedMachineConfig = (selectedMachine as any)?.machineServicesConfig || {};
     const sharedServices = {
       'incoming-service': { port: sharedMachineConfig['incoming-service']?.port || 7000 },
       'mapper-service': { port: sharedMachineConfig['mapper-service']?.port || 4000 },
@@ -604,13 +612,83 @@ export class Orchestrator {
       onLog?.(`  • ${m.machineKey} — app-device:${m.services['app-device-interface'].port} validation:${m.services['validation-engine'].port} tcp:${m.tcpPort}`);
     }
     onLog?.(`[ORCHESTRATOR] Shared services — incoming:${sharedServices['incoming-service'].port} mapper:${sharedServices['mapper-service'].port} dataposting:${sharedServices['dataposting-service'].port} bff:${sharedServices['backend-for-frontend'].port}`);
+    const csndMachines = activeMachines.filter(m => (m as any).isCsnd);
+    const portOverrides: Record<string, Record<number, string>> = {};
 
+    if (csndMachines.length > 0) {
+      onLog?.(`[ORCHESTRATOR] Setting up CSND Modbus RTU simulation for ${csndMachines.length} machine(s)...`);
+
+      for (const m of csndMachines) {
+        try {
+          const csndResult = await emitToInfraWithAck('infra:setup-csnd', {
+            sessionId,
+            machineId: m.id,
+            machineKey: (m as any).machine_key,
+            connectionPools: (m as any).modbusConnections?.map((mc: any) => ({
+              connection_id: mc.connectionId,
+              type: 'Modbus',
+              port_name: mc.portName,
+              baud_rate: 9600,
+              slave_id: mc.slaveId,
+              register_address: mc.registerAddress,
+            })) || [],
+            devices: (m as any).devices || [],
+          }, 30000);
+
+          if (csndResult.portMap) {
+            portOverrides[m.id] = csndResult.portMap;
+            const client = new MongoClient(this.testDbUri);
+
+          try {
+            await client.connect();
+
+            const db = client.db('machine_configurations');
+
+            for (const [connectionId, appPort] of Object.entries(csndResult.portMap)) {
+
+              await db.collection('machines').updateOne(
+                {
+                  ...machineIdFilter(m.id),
+                  'device_config.connection_pools.connection_id': parseInt(connectionId)
+                },
+                {
+                  $set: {
+                    'device_config.connection_pools.$.port_name': appPort
+                  }
+                }
+              );
+            }
+
+            const doc = await db.collection('machines').findOne(machineIdFilter(m.id));
+
+            const pools = doc?.device_config?.connection_pools;
+
+            onLog?.(
+              `[PORT-PATCH] Verified pools: ${JSON.stringify(
+                pools?.map((p: any) => ({
+                  id: p.connection_id,
+                  port: p.port_name
+                }))
+              )}`
+            );
+
+          } finally {
+            await client.close();
+          }
+            onLog?.(`[ORCHESTRATOR] CSND ${(m as any).machine_key} port map: ${JSON.stringify(csndResult.portMap)}`);
+          }
+        } catch (e: any) {
+          onLog?.(`[WARNING] CSND setup failed for ${m.id}: ${e.message}`);
+        }
+      }
+    }
     try {
       onLog?.(`[ORCHESTRATOR] Instructing VM to spawn microservices...`);
       await emitToInfraWithAck('infra:spawn-services', {
         sessionId,
         mongoUri: this.testDbUri,
         dbName,
+        
 
         // ── Legacy single-machine fields (kept for backward compat) ────────
         machineId: selectedMachine?.id || '',
@@ -622,6 +700,7 @@ export class Orchestrator {
         machines: perMachineServices,
         sharedServices,
         totalMachines: activeMachines.length,
+        csndPortOverrides: portOverrides,
       }, 900000);
       onLog?.(`[ORCHESTRATOR] VM services are up.`);
     } catch (e: any) {
@@ -651,21 +730,13 @@ export class Orchestrator {
         const insights = await this.llama.analyzeFailures(failedResults);
 
         for (const insight of insights) {
-          onLog?.(`[AI] ❌ ${insight.testId} (${insight.scenario})`);
-          onLog?.(`     Sort code: expected=${insight.expectedSortCode} actual=${insight.actualSortCode}`);
-          onLog?.(`     Root cause: ${insight.rootCause}`);
-          onLog?.(`     Fix: ${insight.recommendation}`);
-          if (insight.affectedLayers.length > 0) {
-            onLog?.(`     Affected: ${insight.affectedLayers.join(', ')}`);
-          }
+          onLog?.(`[AI] ${insight}`);
         }
 
         // updateAnalysis (upsert) — avoids duplicate _id error from saveAnalysis
         await this.inspectraDb.updateAnalysis(sessionId, {
           failureInsights: insights,
-          failureRecommendations: insights.map(
-            i => `${i.testId}: ${i.rootCause} → ${i.recommendation}`
-          ),
+          failureRecommendations: insights,
         });
 
         onLog?.(`[AI] ✅ Failure analysis saved (${insights.length} insight(s))`);
