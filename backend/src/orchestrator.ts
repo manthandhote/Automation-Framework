@@ -12,6 +12,7 @@ import { exec, ChildProcess } from 'child_process';
 import util from 'util';
 import path from 'path';
 import fs from 'fs';
+import net from 'net';
 import { logger } from './core/logger';
 import { emitToInfra, emitToInfraWithAck } from './index';
 
@@ -30,6 +31,18 @@ export interface ServiceInfo {
   port: number;
   status: 'UP' | 'DOWN';
   pid?: number;
+}
+
+export interface LiveServiceInfo {
+  name: string;
+  port: number;
+  status: 'UP' | 'DOWN' | 'DEGRADED';
+  instances: Array<{
+    machineKey?: string;
+    host: string;
+    port: number;
+    status: 'UP' | 'DOWN';
+  }>;
 }
 
 export class Orchestrator {
@@ -243,12 +256,14 @@ export class Orchestrator {
 
       let pushedAwbs: string[] = [];
 
-      if (dbSummary && dbSummary.machines.length > 0) {
+      const seedableMachines = dbSummary?.machines.filter(m => m.status && !(m as any).isCsnd) || [];
+
+      if (seedableMachines.length > 0) {
         onLog(`[SEEDER] Starting incoming data seed for client: ${config.clientName}`);
         onProgress?.('Seeding Incoming Data', 35);
 
-        // Use the first target machine (or the selected one if machineIds provided)
-        const seedMachine = dbSummary.machines[0];
+        // Profiling machines such as CSND/Cubiscan do not use incoming data.
+        const seedMachine = seedableMachines[0];
 
         try {
           const seeder = new IncomingDataSeeder(this.testDbUri, this.vmIp, this.workspacePath);
@@ -264,7 +279,7 @@ export class Orchestrator {
           onLog(`[WARNING] Incoming data seeding failed: ${e.message} — test builder will fallback to DB lookup`);
         }
       } else {
-        onLog(`[WARNING] No machines found — skipping incoming data seed`);
+        onLog(`[SEEDER] No incoming-data machine selected — skipping incoming data seed`);
       }
 
       // ── STEP 4: LLM Analysis ─────────────────────────────────────────────
@@ -377,6 +392,99 @@ export class Orchestrator {
 
   getHealth(): ServiceInfo[] { return this.services; }
 
+  async getLiveHealth(): Promise<LiveServiceInfo[]> {
+    const host = this.vmIp || process.env.VM_HOST || '127.0.0.1';
+    const fallback: Array<{ name: string; endpoints: Array<{ host: string; port: number; machineKey?: string }> }> = this.services.map(s => ({
+      name: s.name,
+      endpoints: [{ host, port: s.port }],
+    }));
+
+    let serviceTargets: Array<{ name: string; endpoints: Array<{ host: string; port: number; machineKey?: string }> }> = fallback;
+    const client = new MongoClient(this.testDbUri);
+
+    try {
+      await client.connect();
+      const machines = await client
+        .db('machine_configurations')
+        .collection('machines')
+        .find({
+          $or: [
+            { status: true },
+            { machine_status: 'Running' },
+          ],
+        })
+        .toArray();
+
+      if (machines.length > 0) {
+        const endpointMap = new Map<string, Array<{ host: string; port: number; machineKey?: string }>>();
+        const addEndpoint = (serviceName: string, cfg: any, machineKey?: string) => {
+          const port = Number(cfg?.port);
+          if (!port) return;
+          const serviceHost = cfg?.ip && cfg.ip !== '127.0.0.1' ? cfg.ip : host;
+          const current = endpointMap.get(serviceName) || [];
+          const exists = current.some(e => e.host === serviceHost && e.port === port && e.machineKey === machineKey);
+          if (!exists) current.push({ host: serviceHost, port, machineKey });
+          endpointMap.set(serviceName, current);
+        };
+
+        for (const m of machines) {
+          const svc = m.machine_services_config || {};
+          const machineKey = m.machine_key || m._id?.toString();
+          addEndpoint('app-device-interface', svc['app-device-interface'], machineKey);
+          addEndpoint('validation-engine', svc['validation-engine'], machineKey);
+          addEndpoint('incoming-service', svc['incoming-service']);
+          addEndpoint('mapper-service', svc['mapper-service']);
+          addEndpoint('dataposting-service', svc['datauploader-service'] || svc['dataposting-service']);
+          addEndpoint('backend-for-frontend', svc['backend-for-frontend']);
+        }
+
+        serviceTargets = this.services.map(s => ({
+          name: s.name,
+          endpoints: endpointMap.get(s.name) || [{ host, port: s.port }],
+        }));
+      }
+    } catch (err: any) {
+      logger.warn(`[HEALTH] Falling back to default service ports: ${err.message}`, 'HEALTH');
+    } finally {
+      await client.close().catch(() => undefined);
+    }
+
+    return Promise.all(serviceTargets.map(async target => {
+      const instances = await Promise.all(target.endpoints.map(async endpoint => ({
+        machineKey: endpoint.machineKey,
+        host: endpoint.host,
+        port: endpoint.port,
+        status: await this.isPortOpen(endpoint.host, endpoint.port) ? 'UP' as const : 'DOWN' as const,
+      })));
+      const upCount = instances.filter(i => i.status === 'UP').length;
+      const status = upCount === 0 ? 'DOWN' : upCount === instances.length ? 'UP' : 'DEGRADED';
+      return {
+        name: target.name,
+        port: target.endpoints[0]?.port || 0,
+        status,
+        instances,
+      };
+    }));
+  }
+
+  private isPortOpen(host: string, port: number, timeoutMs = 1200): Promise<boolean> {
+    return new Promise(resolve => {
+      const socket = new net.Socket();
+      let settled = false;
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        resolve(ok);
+      };
+      socket.setTimeout(timeoutMs);
+      socket.once('connect', () => finish(true));
+      socket.once('error', () => finish(false));
+      socket.once('timeout', () => finish(false));
+      socket.connect(port, host);
+    });
+  }
+
   async runE2ETests(sessionId: string, onLog: (msg: string) => void, onProgress?: (step: string, percent: number) => void): Promise<E2EReport> {
     const session = await this.inspectraDb.getSession(sessionId);
     if (!session) throw new Error('Session not found');
@@ -441,9 +549,11 @@ export class Orchestrator {
       // ── Re-seed incoming data ──────────────────────────────────────────
       let pushedAwbs: string[] = [];
 
-      if (dbSummary.machines.length > 0 && session.clientName) {
+      const seedableMachines = dbSummary.machines.filter(m => m.status && !(m as any).isCsnd);
+
+      if (seedableMachines.length > 0 && session.clientName) {
         onLog(`[SEEDER] Re-seeding incoming data for rerun...`);
-        const seedMachine = dbSummary.machines[0];
+        const seedMachine = seedableMachines[0];
 
         try {
           const seeder = new IncomingDataSeeder(this.testDbUri, this.vmIp, this.workspacePath);
@@ -454,6 +564,8 @@ export class Orchestrator {
         } catch (e: any) {
           onLog(`[WARNING] Rerun seed failed: ${e.message} — falling back to DB lookup`);
         }
+      } else {
+        onLog(`[SEEDER] No incoming-data machine selected for rerun — skipping seeding`);
       }
 
       let codeSummary: CodeSummary;

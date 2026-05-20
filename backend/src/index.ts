@@ -16,6 +16,10 @@ import { UIValidator } from './frontend-tests/ui-validator';
 import { InspectraDB } from './core/inspectra-db';
 import { TestRunner } from './backend-tests/test-runner';
 import { logger } from './core/logger';
+import { EventEmitter } from 'events';
+
+const infraEvents = new EventEmitter();
+
 
 const execAsync = util.promisify(exec);
 
@@ -53,8 +57,13 @@ bootstrap().catch(err => logger.error('Bootstrap failed', 'BOOTSTRAP', err));
 //  Health
 // ══════════════════════════════════════════════════════════════════════════════
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK', services: orchestrator.getHealth() });
+app.get('/api/health', async (req, res) => {
+  try {
+    const services = await orchestrator.getLiveHealth();
+    res.json({ status: 'OK', services });
+  } catch (err: any) {
+    res.status(500).json({ status: 'ERROR', error: err.message });
+  }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -416,16 +425,28 @@ app.post('/api/analyze-db', async (req, res) => {
 });
 
 
-io.on('connection', (socket) => {
-  logger.info(`Client connected: ${socket.id}`, 'SOCKET');
-  socket.emit('system:init', { health: orchestrator.getHealth() });
+async function broadcastLiveHealth() {
+  try {
+    const health = await orchestrator.getLiveHealth();
+    io.emit('system:health', { health, timestamp: new Date().toISOString() });
+  } catch (err: any) {
+    logger.warn(`[HEALTH] Broadcast failed: ${err.message}`, 'HEALTH');
+  }
+}
 
+setInterval(broadcastLiveHealth, 10000);
+
+io.on('connection', (socket) => {           // ← remove async
+  logger.info(`Client connected: ${socket.id}`, 'SOCKET');
+
+  // ── Register ALL listeners synchronously first ──────────────────────
   socket.on('infra:register', (vmInfo) => {
     infraSocket = socket;
     const vmIp = socket.handshake.address.replace('::ffff:', '');
     orchestrator.setVmIp(vmIp);
     logger.info(`[INFRA] VM Registered: ${vmInfo.hostname} (${vmInfo.os}) from IP ${vmIp}`, 'INFRA');
     io.emit('infra:vm-connected', { hostname: vmInfo.hostname, os: vmInfo.os });
+    infraEvents.emit('registered');
   });
 
   socket.on('infra:status', (status) => {
@@ -435,6 +456,7 @@ io.on('connection', (socket) => {
 
   socket.on('infra:service-status', (data) => {
     logger.info(`[INFRA] Service ${data.serviceName} is ${data.status}`, 'INFRA');
+    broadcastLiveHealth();
   });
 
   socket.on('setup:progress', (data) => { io.emit('setup:progress', data); });
@@ -451,6 +473,11 @@ io.on('connection', (socket) => {
     }
     logger.info(`Client disconnected: ${socket.id}`, 'SOCKET');
   });
+
+  // ── Send init AFTER listeners are registered (fire-and-forget) ──────
+  orchestrator.getLiveHealth()
+    .then(health => socket.emit('system:init', { health }))
+    .catch(() => socket.emit('system:init', { health: [] }));
 });
 
 export const simulateOnInfra = async (data: any): Promise<any> => {
@@ -472,10 +499,30 @@ export const emitToInfra = (event: string, data: any): void => {
   infraSocket.emit(event, data);
 };
 
-export const emitToInfraWithAck = (event: string, data: any, timeoutMs = 300000): Promise<any> => {
+const waitForInfraSocket = (timeoutMs: number): Promise<void> => {
+  if (infraSocket) return Promise.resolve();
   return new Promise((resolve, reject) => {
-    if (!infraSocket) return reject(new Error('No infra-node connected. Is the VM agent running?'));
-    infraSocket.timeout(timeoutMs).emit(event, data, (err: any, response: any) => {
+    logger.info('[INFRA] Waiting for infra-node to register...', 'INFRA');
+
+    const timer = setTimeout(() => {
+      infraEvents.off('registered', onRegistered);
+      reject(new Error('No infra-node connected. Is the VM agent running?'));
+    }, timeoutMs);
+
+    const onRegistered = () => {
+      clearTimeout(timer);
+      logger.info('[INFRA] Infra-node registered — proceeding.', 'INFRA');
+      resolve();
+    };
+
+    infraEvents.once('registered', onRegistered);
+  });
+};
+
+export const emitToInfraWithAck = async (event: string, data: any, timeoutMs = 300000): Promise<any> => {
+  await waitForInfraSocket(Math.min(15000, timeoutMs));  // wait up to 15s
+  return new Promise((resolve, reject) => {
+    infraSocket!.timeout(timeoutMs).emit(event, data, (err: any, response: any) => {
       if (err) return reject(new Error(`Infra ack timeout for event: ${event}`));
       if (!response?.success) return reject(new Error(response?.error || `Infra returned failure for: ${event}`));
       resolve(response);

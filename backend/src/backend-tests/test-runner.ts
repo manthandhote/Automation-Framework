@@ -98,7 +98,7 @@ export class TestRunner {
     private mongoUri: string,
     private workspacePath: string
   ) {
-    this.uiValidator = new UIValidator();
+    this.uiValidator = new UIValidator(mongoUri);
     this.inspectraDb = InspectraDB.getInstance();
   }
 

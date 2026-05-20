@@ -34,6 +34,7 @@ export class TestCaseBuilder {
     const realAwbs: RealAwbContext[] = [];
 
     const useSeededAwbs = pushedAwbs.length > 0;
+    
 
     if (useSeededAwbs) {
       logger.info(
@@ -55,6 +56,9 @@ export class TestCaseBuilder {
       const incomingDb = useSeededAwbs ? null : client.db('incoming_service');
 
       for (const machine of dbSummary.machines.filter(m => m.status)) {
+        const isCsnd =
+        (machine as any).isCsnd === true ||
+        machine.type?.toUpperCase() === 'CSND';
         const machineKey = (machine as any).machine_key || 'MA01';
 
         // ── Get full machine doc (for regex + machineId) ───────────────────

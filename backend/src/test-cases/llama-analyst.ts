@@ -59,7 +59,6 @@ export class LlamaAnalyst {
         let text: string = response.data.response || '';
         console.log('\n================ LLM RAW RESPONSE ================\n');
         console.log(text);
-        console.log('\n=================================================\n');
         logger.info(`[AI] Got response (${text.length} chars)`, 'AI');
         text = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
         return text;
@@ -245,11 +244,9 @@ export class LlamaAnalyst {
     Generate EXACTLY these test cases for EACH machine that has a valid AWB:
 
     1. NORMAL FLOW: Use the "Valid AWB from DB" barcode → expectedSortCode: "SUCC"
-    2. DUPLICATE SCAN: Use the same "Valid AWB from DB" again → expectedSortCode: "DUPR", set isDuplicate: true
+    2. DNF REJECTION: Use the "Fake AWB" barcode (valid format, not in DB) → expectedSortCode: "DNFR"  
     3. INVALID BARCODE: Use "INVALID000" → expectedSortCode: "IBAR"
-    4. DNFR REJECTION: Use the "Fake AWB" barcode (valid format, not in DB) → expectedSortCode: "DNFR"  
-    keep in mind that if the case has expectedSortCode = SUCC, then expect "PASS" as expectedStatus
-    and if the case has expectedSortCode = any other (e.g. DNFR, IBAR, DUPR) then expect "FAIL" as expectedStatus
+    4. DUPLICATE SCAN: Use the same "Valid AWB from DB" again → expectedSortCode: "SBRR", set isDuplicate: true
 
     STRICT RULES:
     - NEVER invent barcodes. Use ONLY the exact AWB values provided above.
@@ -353,7 +350,7 @@ export class LlamaAnalyst {
           scenario: 'duplicate_scan',
           description: `Same AWB fed twice → expect (FAIL) DUPR `,
           expectedStatus: 'FAIL',
-          expectedSortCode: 'DUPR',
+          expectedSortCode: 'SBRR',
           barcode: ctx.validAwb,
           machineName: ctx.machineKey,
           machineId: ctx.machineId,

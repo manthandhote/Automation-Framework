@@ -12,6 +12,22 @@ import { ExecutionReport } from './components/ExecutionReport';
 import './index.css';
 
 const API_BASE = `http://localhost:4200`;
+type ServiceStatus = 'UP' | 'DOWN' | 'DEGRADED';
+type ServiceHealth = {
+  name: string;
+  port: number;
+  status: ServiceStatus;
+  instances?: Array<{ machineKey?: string; host: string; port: number; status: 'UP' | 'DOWN' }>;
+};
+
+const DEFAULT_SERVICE_HEALTH: Record<string, ServiceHealth> = {
+  'app-device-interface': { name: 'app-device-interface', port: 5500, status: 'DOWN' },
+  'incoming-service': { name: 'incoming-service', port: 7000, status: 'DOWN' },
+  'validation-engine': { name: 'validation-engine', port: 5000, status: 'DOWN' },
+  'mapper-service': { name: 'mapper-service', port: 4000, status: 'DOWN' },
+  'dataposting-service': { name: 'dataposting-service', port: 4100, status: 'DOWN' },
+  'backend-for-frontend': { name: 'backend-for-frontend', port: 5026, status: 'DOWN' },
+};
 
 const App = () => {
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -19,88 +35,64 @@ const App = () => {
   const [infraStatus, setInfraStatus] = useState<any>(null);
   const [logs, setLogs] = useState<{ data: string, timestamp: string }[]>([]);
   const [selectedProtocol, setSelectedProtocol] = useState<'capella' | 'astro'>('capella');
+  const [lastHealthSync, setLastHealthSync] = useState<string | null>(null);
+  const [serviceHealthMap, setServiceHealthMap] = useState<Record<string, ServiceHealth>>(DEFAULT_SERVICE_HEALTH);
 
-  // Tracking individual services via log parsing since backend doesn't update health array
-  const [serviceStatusMap, setServiceStatusMap] = useState<Record<string, string>>({
-    'app-device-interface': 'DOWN',
-    'incoming-service': 'DOWN',
-    'validation-engine': 'DOWN',
-    'mapper-service': 'DOWN',
-    'dataposting-service': 'DOWN',
-    'backend-for-frontend': 'DOWN'
-  });
+  const applyHealth = (health: ServiceHealth[]) => {
+    const map: Record<string, ServiceHealth> = {};
+    health.forEach(h => { map[h.name] = h; });
+    setServiceHealthMap(prev => ({ ...prev, ...map }));
+    setLastHealthSync(new Date().toLocaleTimeString());
+  };
+
+  const fetchHealth = async () => {
+    try {
+      const res = await axios.get(`${API_BASE}/api/health`);
+      applyHealth(res.data.services || []);
+    } catch (err) {
+      console.error('Health sync failed', err);
+    }
+  };
+
+  const serviceStatusMap = useMemo<Record<string, ServiceStatus>>(() => {
+    return Object.fromEntries(
+      Object.entries(serviceHealthMap).map(([name, service]) => [name, service.status])
+    );
+  }, [serviceHealthMap]);
 
   useEffect(() => {
     socket.on('system:init', (data) => {
       if (Array.isArray(data.health)) {
-        const map: Record<string, string> = {};
-        data.health.forEach((h: any) => {
-          // Only update if the backend reports UP, or if we don't have a status yet
-          // This prevents the static 'DOWN' from the backend from overwriting our inferred 'UP'
-          if (h.status === 'UP' || !serviceStatusMap[h.name]) {
-            map[h.name] = h.status;
-          }
-        });
-        setServiceStatusMap(prev => ({ ...prev, ...map }));
+        applyHealth(data.health);
+      }
+    });
+
+    socket.on('system:health', (data) => {
+      if (Array.isArray(data.health)) {
+        applyHealth(data.health);
       }
     });
 
     socket.on('infra:vm-status', (status) => {
       setInfraStatus(status);
-      // If VM is reachable and core infra is running, we can reasonably assume 
-      // the services are UP as well (per user's PM2 manual start)
-      if (status && (status.nginx === 'RUNNING' || status.php === 'INSTALLED')) {
-        setServiceStatusMap(prev => {
-          const newMap = { ...prev };
-          Object.keys(newMap).forEach(key => {
-            if (newMap[key] === 'DOWN') newMap[key] = 'UP';
-          });
-          return newMap;
-        });
-      }
+      fetchHealth();
     });
 
     socket.on('simulator:packet', (log) => {
       setLogs(prev => [log, ...prev].slice(0, 100));
-
-      // Smart Health: Parse logs for any service activity
-      // If a service emits a log, it is definitely UP
-      const serviceMatch = log.data.match(/\[(.*?)\]/);
-      if (serviceMatch && serviceMatch[1]) {
-        const serviceName = serviceMatch[1].toLowerCase();
-        // Check if this matches any of our services (with or without -service suffix)
-        const targetService = Object.keys(serviceStatusMap).find(s =>
-          s.toLowerCase() === serviceName || s.toLowerCase().replace('-service', '') === serviceName
-        );
-        if (targetService) {
-          setServiceStatusMap(prev => ({ ...prev, [targetService]: 'UP' }));
-        }
-      }
-
-      // Legacy [spawn] parsing
-      if (log.data.includes('[spawn]') && log.data.includes('-> UP')) {
-        const parts = log.data.split(' ');
-        const serviceName = parts[1];
-        if (serviceName) {
-          setServiceStatusMap(prev => ({ ...prev, [serviceName]: 'UP' }));
-        }
-      }
-
-      if (log.data.includes('[spawn]') && log.data.includes('-> FAILED')) {
-        const parts = log.data.split(' ');
-        const serviceName = parts[1];
-        if (serviceName) {
-          setServiceStatusMap(prev => ({ ...prev, [serviceName]: 'DOWN' }));
-        }
-      }
     });
 
+    fetchHealth();
+    const timer = window.setInterval(fetchHealth, 10000);
+
     return () => {
+      window.clearInterval(timer);
       socket.off('system:init');
+      socket.off('system:health');
       socket.off('infra:vm-status');
       socket.off('simulator:packet');
     };
-  }, [serviceStatusMap]);
+  }, []);
 
   const runSimulation = async (type: string) => {
     try {
@@ -203,30 +195,34 @@ const App = () => {
                   <div className="metric-label">Microservices Health</div>
                   <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                     <button
-                      onClick={() => {
-                        setServiceStatusMap(prev => {
-                          const newMap = { ...prev };
-                          Object.keys(newMap).forEach(k => newMap[k] = 'UP');
-                          return newMap;
-                        });
-                      }}
+                      onClick={fetchHealth}
                       style={{ background: 'rgba(0,242,255,0.1)', border: '1px solid var(--primary-glow)', color: 'var(--primary-glow)', fontSize: '0.6rem', padding: '2px 8px', borderRadius: '4px', cursor: 'pointer', fontWeight: 700 }}
                     >
-                      SYNC PM2
+                      REFRESH
                     </button>
                     <div className="badge badge-success" style={{ fontSize: '0.6rem' }}>{activeServicesCount}/6 UP</div>
                   </div>
                 </div>
+                {lastHealthSync && (
+                  <div style={{ fontSize: '0.65rem', color: 'var(--text-dim)', marginTop: '-1rem', marginBottom: '1rem' }}>
+                    Last checked: {lastHealthSync}
+                  </div>
+                )}
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
                   {Object.entries(serviceStatusMap).map(([name, status]) => (
                     <div key={name} style={{ background: 'rgba(0,0,0,0.2)', padding: '0.75rem', borderRadius: '12px', border: '1px solid var(--glass-border)', position: 'relative', overflow: 'hidden' }}>
-                      {status === 'UP' && <div style={{ position: 'absolute', top: 0, left: 0, height: '100%', width: '2px', background: 'var(--accent-green)', boxShadow: '0 0 10px var(--accent-green)' }} />}
+                      {status !== 'DOWN' && <div style={{ position: 'absolute', top: 0, left: 0, height: '100%', width: '2px', background: status === 'UP' ? 'var(--accent-green)' : 'var(--accent-gold)', boxShadow: `0 0 10px ${status === 'UP' ? 'var(--accent-green)' : 'var(--accent-gold)'}` }} />}
                       <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{name.replace('-service', '')}</div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                        <div className={status === 'UP' ? 'pulse-success' : ''} style={{ width: '6px', height: '6px', borderRadius: '50%', background: status === 'UP' ? 'var(--accent-green)' : 'var(--accent-pink)', boxShadow: `0 0 8px ${status === 'UP' ? 'var(--accent-green)' : 'var(--accent-pink)'}` }} />
-                        <span style={{ fontSize: '0.8rem', fontWeight: 700, color: status === 'UP' ? 'var(--accent-green)' : 'var(--accent-pink)' }}>
+                        <div className={status === 'UP' ? 'pulse-success' : ''} style={{ width: '6px', height: '6px', borderRadius: '50%', background: status === 'UP' ? 'var(--accent-green)' : status === 'DEGRADED' ? 'var(--accent-gold)' : 'var(--accent-pink)', boxShadow: `0 0 8px ${status === 'UP' ? 'var(--accent-green)' : status === 'DEGRADED' ? 'var(--accent-gold)' : 'var(--accent-pink)'}` }} />
+                        <span style={{ fontSize: '0.8rem', fontWeight: 700, color: status === 'UP' ? 'var(--accent-green)' : status === 'DEGRADED' ? 'var(--accent-gold)' : 'var(--accent-pink)' }}>
                           {status}
                         </span>
+                      </div>
+                      <div style={{ fontSize: '0.65rem', color: 'var(--text-dim)', marginTop: '4px' }}>
+                        {(serviceHealthMap[name]?.instances?.length || 1) > 1
+                          ? `${serviceHealthMap[name]?.instances?.filter(i => i.status === 'UP').length || 0}/${serviceHealthMap[name]?.instances?.length || 0} instances`
+                          : `:${serviceHealthMap[name]?.port || ''}`}
                       </div>
                     </div>
                   ))}

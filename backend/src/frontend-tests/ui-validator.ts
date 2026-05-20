@@ -1,6 +1,7 @@
 import { chromium, Browser, Page } from 'playwright';
 import { logger } from '../core/logger';
 import { BaselineManager } from '../core/baseline-manager';
+import { MongoClient } from 'mongodb';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -19,9 +20,11 @@ export interface UIValidationResult {
 export class UIValidator {
   private browser: Browser | null = null;
   private baselineMgr: BaselineManager;
+  private mongoUri: string;
 
-  constructor() {
+  constructor(mongoUri: string = process.env.TEST_DB_URI || process.env.INSPECTRA_DB_URI || 'mongodb://127.0.0.1:27017') {
     this.baselineMgr = new BaselineManager();
+    this.mongoUri = mongoUri;
   }
 
   // screenshotsDir is now passed in explicitly from the test runner.
@@ -75,12 +78,31 @@ export class UIValidator {
         // Already logged in (session cookie still alive) — skip login
         logger.info(`[UI-VALIDATOR] Already authenticated, skipping login.`, 'UI-VALIDATOR');
       } else {
-        await page.fill('input[name="username"]', process.env.FE_USERNAME || 'nidoadmin');
-        await page.fill('input[name="password"]', process.env.FE_PASSWORD || 'Nido@46yegh2026');
-        await Promise.all([
-          page.waitForURL(/dashboard/, { timeout: 20000 }),
-          page.click('button[name="login"]')
-        ]);
+        const credentials = await this.resolveLoginCredentials();
+        let loginSucceeded = false;
+        let lastLoginError = '';
+
+        for (const credential of credentials) {
+          try {
+            logger.info(`[UI-VALIDATOR] Trying dashboard user "${credential.username}"`, 'UI-VALIDATOR');
+            await page.fill('input[name="username"]', credential.username);
+            await page.fill('input[name="password"]', credential.password);
+            await Promise.all([
+              page.waitForURL(/dashboard/, { timeout: 15000 }),
+              page.click('button[name="login"]')
+            ]);
+            loginSucceeded = true;
+            break;
+          } catch (err: any) {
+            lastLoginError = err.message;
+            logger.warn(`[UI-VALIDATOR] Login failed for "${credential.username}": ${err.message}`, 'UI-VALIDATOR');
+            await page.goto(`http://${feHost}:7001/index.php`, { timeout: 20000, waitUntil: 'domcontentloaded' });
+          }
+        }
+
+        if (!loginSucceeded) {
+          throw new Error(`Dashboard login failed for all resolved users. Last error: ${lastLoginError}`);
+        }
       }
 
       logger.info(`[UI-VALIDATOR] Navigating to Master Search...`, 'UI-VALIDATOR');
@@ -300,5 +322,61 @@ export class UIValidator {
       await this.browser.close();
       this.browser = null;
     }
+  }
+
+  private async resolveLoginCredentials(): Promise<Array<{ username: string; password: string }>> {
+    if (process.env.FE_USERNAME && process.env.FE_PASSWORD) {
+      return [{
+        username: process.env.FE_USERNAME,
+        password: process.env.FE_PASSWORD,
+      }];
+    }
+
+    const knownPasswords: Record<string, string> = {
+      adminuser: 'Nido@2023',
+      nidoadmin: 'Nido@46yegh2026',
+    };
+    const supportedUsers = Object.keys(knownPasswords);
+    const client = new MongoClient(this.mongoUri);
+
+    try {
+      await client.connect();
+      const users = await client
+        .db('identity_service')
+        .collection('users')
+        .find({
+          username: { $in: supportedUsers },
+          status: { $regex: /^active$/i },
+        })
+        .toArray();
+
+      const selected =
+        users.find(u => u.username === 'adminuser') ||
+        users.find(u => u.username === 'nidoadmin');
+
+      if (selected?.username && knownPasswords[selected.username]) {
+        return this.uniqueCredentials([{
+          username: selected.username,
+          password: knownPasswords[selected.username],
+        }, ...supportedUsers.map(username => ({ username, password: knownPasswords[username] }))]);
+      }
+    } catch (err: any) {
+      logger.warn(`[UI-VALIDATOR] Could not resolve login from identity_service.users: ${err.message}`, 'UI-VALIDATOR');
+    } finally {
+      await client.close().catch(() => undefined);
+    }
+
+    return this.uniqueCredentials(
+      supportedUsers.map(username => ({ username, password: knownPasswords[username] }))
+    );
+  }
+
+  private uniqueCredentials(credentials: Array<{ username: string; password: string }>) {
+    const seen = new Set<string>();
+    return credentials.filter(credential => {
+      if (seen.has(credential.username)) return false;
+      seen.add(credential.username);
+      return true;
+    });
   }
 }
