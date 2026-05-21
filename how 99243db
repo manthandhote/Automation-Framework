@@ -1,0 +1,17 @@
+* [33m99243db[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mworking-with-cubiscan[m[33m, [m[1;31morigin/working-with-cubiscan[m[33m, [m[1;31morigin/NIT-15-module-division[m[33m)[m CSND setup
+* [33m9fa2b3f[m cubiscan setup
+* [33m3aad913[m[33m ([m[1;31morigin/module-division[m[33m, [m[1;32mwithout-CSND[m[33m, [m[1;32mmodule-division[m[33m)[m full-working without CSND
+* [33m1b82cbc[m[33m ([m[1;32mworking_code_Clientwise[m[33m)[m updated client-wise testing done
+* [33m06ab78d[m[33m ([m[1;32mfull_working_with_DB_clone[m[33m)[m shifted to clone db functionality
+* [33mdd3de1b[m[33m ([m[1;32mfull_working_with_db_archieve[m[33m)[m working code with db archieve file
+* [33mc66c82e[m[33m ([m[1;32mmodular[m[33m)[m Added modular architecture changes
+* [33m5970c98[m[33m ([m[1;32mnon-module[m[33m, [m[1;32mallTestcases[m[33m)[m Updated frontend components and styles
+* [33m90da032[m Added all test cases
+* [33md4e99d5[m[33m ([m[1;32msession-wise-db[m[33m, [m[1;32mpm2-run[m[33m, [m[1;32mmain[m[33m, [m[1;32mCode-clone[m[33m)[m updated VM operaions code cloned
+* [33m5ee87d4[m Added infra-node setup and AI simulation fixes
+[31m|[m * [33m78d8f9c[m[33m ([m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m, [m[1;32mNIT-15-module-division[m[33m)[m NIT-15: remove from read me
+[31m|[m[31m/[m  
+* [33m157a183[m Added Read me infra
+* [33macfbc8a[m Updated Reade me and removed unused files
+* [33m6e858f4[m Initial-Project
+* [33m78d5c53[m[33m ([m[1;31morigin/initial[m[33m)[m Added README file
